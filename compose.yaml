@@ -1,0 +1,97 @@
+# Lokale demoketen: uitgever (gemeente Lindevoort), inkomensregister (verifier) en, op verzoek,
+# demo en tests. Start alles met: make demo
+name: agent-mandaatbewijs
+
+x-omgeving: &omgeving
+  UITGEVER_ISS: http://uitgever:8000
+  VERIFIER_AUD: http://inkomensregister:8000
+  STATUSLIJST_TTL: "5"
+  STATUSLIJST_GELDIG: "60"
+  STA_HTTP_TOE: "1"
+  TZ: Europe/Amsterdam
+
+x-app: &app
+  build: .
+  image: agent-mandaatbewijs:lokaal
+
+services:
+  uitgever:
+    <<: *app
+    command: ["mandaatbewijs-uitgever"]
+    environment:
+      <<: *omgeving
+      UITGEVER_DATA: /data
+    volumes:
+      - data-uitgever:/data
+    ports:
+      - "127.0.0.1:8001:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/gezond', timeout=3)"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  inkomensregister:
+    <<: *app
+    command: ["mandaatbewijs-verifier"]
+    environment:
+      <<: *omgeving
+      VERIFIER_DATA: /data
+      VERTROUWENSLIJST: /app/vertrouwenslijst.json
+      STATUS_VERVERS_S: "5"
+    volumes:
+      - data-verifier:/data
+    ports:
+      - "127.0.0.1:8002:8000"
+    depends_on:
+      uitgever:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/gezond', timeout=3)"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  demo:
+    <<: *app
+    profiles: ["demo"]
+    command: ["mandaatbewijs-demo"]
+    environment:
+      <<: *omgeving
+      UITGEVER_DATA: /data-uitgever
+      VERIFIER_DATA: /data-verifier
+      DEMO_BREEDTE: ${DEMO_BREEDTE:-118}
+      PLANNER: ${PLANNER:-deterministisch}
+      DEMO_TEMPO: ${DEMO_TEMPO:-0}
+      AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT:-}
+      AZURE_OPENAI_DEPLOYMENT: ${AZURE_OPENAI_DEPLOYMENT:-}
+      AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY:-}
+      OPENAI_API_VERSION: ${OPENAI_API_VERSION:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    volumes:
+      - data-uitgever:/data-uitgever:ro
+      - data-verifier:/data-verifier:ro
+    depends_on:
+      inkomensregister:
+        condition: service_healthy
+
+  tests:
+    <<: *app
+    profiles: ["tests"]
+    command: ["pytest", "-m", "integratie", "-v", "-p", "no:cacheprovider"]
+    environment:
+      <<: *omgeving
+      UITGEVER_DATA: /data-uitgever
+      VERIFIER_DATA: /data-verifier
+    volumes:
+      - data-uitgever:/data-uitgever:ro
+      - data-verifier:/data-verifier:ro
+    depends_on:
+      inkomensregister:
+        condition: service_healthy
+
+volumes:
+  data-uitgever:
+  data-verifier:

@@ -1,0 +1,738 @@
+"""De verifier: bronnen (metadata, JWKS, statuslijst, cache) en de verificatiestappen."""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from pathlib import Path
+from typing import Any
+
+import httpx2
+import pytest
+from starlette.testclient import TestClient
+
+from mandaatbewijs.houder.portemonnee import Portemonnee
+from mandaatbewijs.sdjwt import Credential, geef_uit
+from mandaatbewijs.sleutels import Sleutelpaar
+from mandaatbewijs.statuslijst import Statuslijst, Tokenbeleid, maak_token
+from mandaatbewijs.uitgever.app import Dienst
+from mandaatbewijs.uitgever.gegevens import VCT
+from mandaatbewijs.uitgever.uitgifte import PER_ELEMENT, VERBORGEN
+from mandaatbewijs.verifier import bronnen
+from mandaatbewijs.verifier.bronnen import BronFout, Ophaler, Sleutelbron, Statusbron
+from mandaatbewijs.verifier.nonces import Nonces
+from mandaatbewijs.verifier.verificatie import Verificatie, Weigering
+from mandaatbewijs.verifier.vertrouwenslijst import Uitgever, Vertrouwenslijst
+from tests.unit.conftest import ISS, login, verleen
+
+AUD = "http://inkomensregister:8000"
+LINDEVOORT = Uitgever(ISS, "Lindevoort", frozenset({VCT}))
+
+
+def _verificatie(tmp_path: Path, transport: httpx2.AsyncBaseTransport) -> Verificatie:
+    ophaler = Ophaler(True, frozenset({"localhost"}), httpx2.AsyncClient(transport=transport))
+    sleutelbron = Sleutelbron(ophaler)
+    return Verificatie(
+        AUD,
+        Vertrouwenslijst([LINDEVOORT]),
+        sleutelbron,
+        Statusbron(ophaler, sleutelbron),
+        Nonces(tmp_path / "nonces.db"),
+    )
+
+
+def _agent(client: TestClient, uitgever: Dienst, dossiers: list[str] | None = None) -> Portemonnee:
+    sleutel = Sleutelpaar.nieuw("agent")
+    serialisatie, _ = verleen(client, uitgever, sleutel, dossiers)
+    return Portemonnee(sleutel, ISS, Credential.uit_serialisatie(serialisatie))
+
+
+def _presenteer(v: Verificatie, agent: Portemonnee, dossier: str, met_doel: bool = True) -> str:
+    gekozen = agent.disclosures_voor("inkomen:lezen", dossier, met_doel)
+    return agent.presentatie(AUD, v.nonces.nieuw(), gekozen)
+
+
+def _idx(agent: Portemonnee) -> int:
+    assert agent.credential is not None
+    return int(agent.credential.payload["status"]["status_list"]["idx"])
+
+
+def _loop(coro: Any) -> Any:
+    return asyncio.run(coro)
+
+
+def test_toegestaan_binnen_mandaat(
+    tmp_path: Path, uitgever_client: TestClient, uitgever: Dienst, uitgever_transport: Any
+) -> None:
+    v = _verificatie(tmp_path, uitgever_transport)
+    agent = _agent(uitgever_client, uitgever)
+    toelating = _loop(
+        v.verifieer(_presenteer(v, agent, "2026-0142"), "inkomen_opvragen", "2026-0142")
+    )
+    assert toelating.iss == ISS
+    assert toelating.uitgever == "Lindevoort"
+    assert toelating.jkt == agent.jkt
+    assert toelating.actie == "inkomen:lezen"
+    assert toelating.doel == "aanvraag-levensonderhoud"
+    assert toelating.status_bron == "vers"
+    # Bekendgemaakte lijstelementen tellen onder de naam van hun lijstclaim.
+    assert toelating.bekendgemaakt == ["acties", "doel", "dossiers"]
+
+
+def _weigering(
+    v: Verificatie,
+    presentatie: str,
+    tool: str = "inkomen_opvragen",
+    dossier: str | None = "2026-0142",
+) -> Weigering:
+    with pytest.raises(Weigering) as info:
+        _loop(v.verifieer(presentatie, tool, dossier))
+    return info.value
+
+
+def test_bereik_en_doel(
+    tmp_path: Path, uitgever_client: TestClient, uitgever: Dienst, uitgever_transport: Any
+) -> None:
+    v = _verificatie(tmp_path, uitgever_transport)
+    agent = _agent(uitgever_client, uitgever)
+    assert agent.credential is not None
+    jti = agent.credential.payload["jti"]
+    w = _weigering(v, _presenteer(v, agent, "2026-0157"), dossier="2026-0157")
+    assert (w.reden, w.status) == ("dossier_buiten_mandaat", 403)
+    bereik = [w]
+    w = _weigering(v, _presenteer(v, agent, "2026-0142"), tool="correctie_indienen")
+    assert (w.reden, w.status) == ("actie_buiten_mandaat", 403)
+    bereik.append(w)
+    w = _weigering(v, _presenteer(v, agent, "2026-0142", met_doel=False))
+    assert w.reden == "doel_niet_geaccepteerd"
+    bereik.append(w)
+    # Bij een bereikweigering is de credential geverifieerd: (iss, jti) staan bevestigd in de audit.
+    for w in bereik:
+        assert w.bevestigd == {"iss": ISS, "jti": jti, "jkt": agent.jkt}, w.reden
+        assert w.onbevestigd == {}
+    w = _weigering(v, _presenteer(v, agent, "2026-0142"), tool="onbekend")
+    assert w.reden == "tool_onbekend"
+    w = _weigering(v, _presenteer(v, agent, "2026-0142"), dossier=None)
+    assert w.reden == "dossier_ontbreekt"
+
+
+def test_nonce_eenmalig_en_aud(
+    tmp_path: Path, uitgever_client: TestClient, uitgever: Dienst, uitgever_transport: Any
+) -> None:
+    v = _verificatie(tmp_path, uitgever_transport)
+    agent = _agent(uitgever_client, uitgever)
+    presentatie = _presenteer(v, agent, "2026-0142")
+    _loop(v.verifieer(presentatie, "inkomen_opvragen", "2026-0142"))
+    assert _weigering(v, presentatie).reden == "nonce_onbekend_of_gebruikt"
+    onbekend = agent.presentatie(
+        AUD, "verzonnen", agent.disclosures_voor("inkomen:lezen", "2026-0142", True)
+    )
+    assert _weigering(v, onbekend).reden == "nonce_onbekend_of_gebruikt"
+    andere_aud = agent.presentatie(
+        "http://ander:8000",
+        v.nonces.nieuw(),
+        agent.disclosures_voor("inkomen:lezen", "2026-0142", True),
+    )
+    assert _weigering(v, andere_aud).reden == "aud_onjuist"
+
+
+def test_key_binding_met_andere_sleutel(
+    tmp_path: Path, uitgever_client: TestClient, uitgever: Dienst, uitgever_transport: Any
+) -> None:
+    v = _verificatie(tmp_path, uitgever_transport)
+    agent = _agent(uitgever_client, uitgever)
+    dief = Portemonnee(Sleutelpaar.nieuw("dief"), ISS, agent.credential)
+    w = _weigering(v, _presenteer(v, dief, "2026-0142"))
+    assert w.reden == "kb_handtekening_ongeldig"
+    assert w.onbevestigd["iss"] == ISS
+
+
+def test_uitgever_niet_vertrouwd_zonder_netwerk(tmp_path: Path) -> None:
+    def geen_netwerk(request: httpx2.Request) -> httpx2.Response:
+        raise AssertionError(f"onverwacht netwerkverkeer naar {request.url}")
+
+    v = _verificatie(tmp_path, httpx2.MockTransport(geen_netwerk))
+    elsweerd, agent = Sleutelpaar.nieuw("elsweerd"), Sleutelpaar.nieuw("agent")
+    nu = int(time.time())
+    claims = {
+        "iss": "http://elsweerd:8000",
+        "vct": VCT,
+        "jti": "m-1",
+        "iat": nu,
+        "nbf": nu,
+        "exp": nu + 60,
+        "cnf": {"jwk": agent.publieke_jwk},
+        "status": {"status_list": {"idx": 1, "uri": "http://elsweerd:8000/statuslijsten/1"}},
+        "doel": "heronderzoek",
+        "medewerker": {"id": "x"},
+        "afdeling": "y",
+        "acties": ["inkomen:lezen"],
+        "dossiers": ["2026-0142"],
+    }
+    serialisatie, _ = geef_uit(elsweerd, claims, set(VERBORGEN), set(PER_ELEMENT))
+    p = Portemonnee(agent, "http://elsweerd:8000", Credential.uit_serialisatie(serialisatie))
+    w = _weigering(v, _presenteer(v, p, "2026-0142"))
+    assert w.reden == "uitgever_niet_vertrouwd"
+    assert (w.bevestigd, w.onbevestigd) == ({}, {"iss": "http://elsweerd:8000"})
+    # Zelfde uitgever, maar een onbekend credentialtype.
+    v2 = _verificatie(tmp_path / "2", httpx2.MockTransport(geen_netwerk))
+    v2.vertrouwenslijst = Vertrouwenslijst(
+        [Uitgever("http://elsweerd:8000", "E", frozenset({"x"}))]
+    )
+    assert _weigering(v2, _presenteer(v2, p, "2026-0142")).reden == "vct_niet_toegestaan"
+
+
+def test_ingetrokken_via_statuslijst_na_verversing(
+    tmp_path: Path, uitgever_client: TestClient, uitgever: Dienst, uitgever_transport: Any
+) -> None:
+    v = _verificatie(tmp_path, uitgever_transport)
+    sleutel = Sleutelpaar.nieuw("agent")
+    serialisatie, mandaat_id = verleen(uitgever_client, uitgever, sleutel)
+    agent = Portemonnee(sleutel, ISS, Credential.uit_serialisatie(serialisatie))
+    _loop(v.verifieer(_presenteer(v, agent, "2026-0142"), "inkomen_opvragen", "2026-0142"))
+    uitgever_client.delete(f"/mandaten/{mandaat_id}", auth=login(uitgever, "sanne"))
+    # Binnen de ttl (1 s) nog uit de cache toegestaan; daarna geweigerd.
+    t = _loop(v.verifieer(_presenteer(v, agent, "2026-0142"), "inkomen_opvragen", "2026-0142"))
+    assert t.status_bron == "cache"
+    time.sleep(1.1)
+    w = _weigering(v, _presenteer(v, agent, "2026-0142"))
+    assert (w.reden, w.status) == ("mandaat_ingetrokken", 403)
+    assert w.bevestigd["jti"] == mandaat_id
+    assert w.onbevestigd == {}
+
+
+def test_statuscache_overbrugt_netwerkfout_maar_niet_ongeldig_token(
+    tmp_path: Path, uitgever_client: TestClient, uitgever: Dienst, uitgever_transport: Any
+) -> None:
+    v = _verificatie(tmp_path, uitgever_transport)
+    agent = _agent(uitgever_client, uitgever)
+    uri = f"{ISS}/statuslijsten/1"
+    idx = _idx(agent)
+    _loop(v.statusbron.ververs(uri, LINDEVOORT))
+    time.sleep(1.1)
+    # Netwerkfout: overbrugging tot exp.
+    weg = httpx2.MockTransport(lambda r: (_ for _ in ()).throw(httpx2.ConnectError("weg")))
+    v.statusbron.ophaler.client = httpx2.AsyncClient(transport=weg)  # type: ignore[arg-type]
+    uitkomst = _loop(v.statusbron.status(uri, idx, LINDEVOORT))
+    assert uitkomst.bron == "cache-verouderd"
+    # Ongeldig token: cache onbruikbaar, ook bij een latere netwerkfout.
+    rommel = httpx2.MockTransport(
+        lambda r: httpx2.Response(
+            200, text="a.b.c", headers={"content-type": "application/statuslist+jwt"}
+        )
+    )
+    v.statusbron.ophaler.client = httpx2.AsyncClient(transport=rommel)  # type: ignore[arg-type]
+    with pytest.raises(BronFout) as info:
+        _loop(v.statusbron.ververs(uri, LINDEVOORT))
+    assert info.value.klasse == "ongeldig"
+    v.statusbron.ophaler.client = httpx2.AsyncClient(transport=weg)  # type: ignore[arg-type]
+    with pytest.raises(BronFout) as info:
+        _loop(v.statusbron.status(uri, idx, LINDEVOORT))
+    assert info.value.reden == "status_onbekend"
+    assert _weigering(v, _presenteer(v, agent, "2026-0142")).reden == "status_onbekend"
+    # Een geldige verversing herstelt de cache.
+    v.statusbron.ophaler.client = httpx2.AsyncClient(transport=uitgever_transport)
+    assert _loop(v.statusbron.status(uri, idx, LINDEVOORT)).bron == "vers"
+
+
+def test_geen_cache_en_onbereikbaar_is_status_onbekend(
+    tmp_path: Path, uitgever_client: TestClient, uitgever: Dienst, uitgever_transport: Any
+) -> None:
+    v = _verificatie(tmp_path, uitgever_transport)
+    agent = _agent(uitgever_client, uitgever)
+    uri = f"{ISS}/statuslijsten/1"
+    idx = _idx(agent)
+    weg = httpx2.MockTransport(lambda r: httpx2.Response(503))
+    v.statusbron.ophaler.client = httpx2.AsyncClient(transport=weg)  # type: ignore[arg-type]
+    with pytest.raises(BronFout) as info:
+        _loop(v.statusbron.status(uri, idx, LINDEVOORT))
+    assert (info.value.reden, info.value.klasse) == ("status_onbekend", "netwerk")
+
+
+def test_metadata_issuer_moet_kloppen(tmp_path: Path) -> None:
+    def antwoord(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, json={"issuer": "http://ander:8000", "jwks": {"keys": []}})
+
+    ophaler = Ophaler(
+        True, frozenset({"localhost"}), httpx2.AsyncClient(transport=httpx2.MockTransport(antwoord))
+    )  # type: ignore[arg-type]
+    with pytest.raises(BronFout) as info:
+        _loop(Sleutelbron(ophaler).sleutel(LINDEVOORT, "kid"))
+    assert info.value.reden == "uitgever_metadata_onjuist"
+
+
+def test_jwks_via_jwks_uri_en_onbekende_kid_begrensd(tmp_path: Path) -> None:
+    sleutel = Sleutelpaar.nieuw("k1")
+    teller = {"meta": 0}
+
+    def antwoord(request: httpx2.Request) -> httpx2.Response:
+        if request.url.path.endswith("jwt-vc-issuer"):
+            teller["meta"] += 1
+            return httpx2.Response(200, json={"issuer": ISS, "jwks_uri": f"{ISS}/jwks.json"})
+        return httpx2.Response(
+            200, json={"keys": [sleutel.jwks_lid]}, headers={"cache-control": "max-age=1000"}
+        )
+
+    ophaler = Ophaler(
+        True, frozenset({"localhost"}), httpx2.AsyncClient(transport=httpx2.MockTransport(antwoord))
+    )  # type: ignore[arg-type]
+    bron = Sleutelbron(ophaler)
+    assert _loop(bron.sleutel(LINDEVOORT, "k1")).thumbprint() == sleutel.jkt
+    with pytest.raises(BronFout):
+        _loop(bron.sleutel(LINDEVOORT, "k2"))
+    assert teller["meta"] == 1  # net opgehaald: een onbekende kid dwingt geen nieuwe ophaalactie af
+    bron._caches[ISS].laatste_poging = 0
+    with pytest.raises(BronFout):
+        _loop(bron.sleutel(LINDEVOORT, "k2"))
+    assert teller["meta"] == 2  # na 10 s wel opnieuw opgehaald
+    with pytest.raises(BronFout):
+        _loop(bron.sleutel(LINDEVOORT, "k3"))
+    assert teller["meta"] == 2  # en daarna weer begrensd
+
+
+def test_url_controles(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        bronnen.socket, "getaddrinfo", lambda host, *_a: [(0, 0, 0, "", ("10.0.0.5", 0))]
+    )
+    leeg = httpx2.MockTransport(lambda r: httpx2.Response(200, json={}))
+    ophaler = Ophaler(True, frozenset({"uitgever"}), httpx2.AsyncClient(transport=leeg))  # type: ignore[arg-type]
+    ophaler.controleer_url("http://uitgever:8000/jwks.json", "http://uitgever:8000")
+    _loop(
+        ophaler.haal("http://uitgever:8000/jwks.json", "http://uitgever:8000", "application/json")
+    )
+    for url, iss, reden in [
+        ("http://ander:8000/jwks.json", "http://uitgever:8000", "url_andere_oorsprong"),
+        ("http://uitgever:9000/jwks.json", "http://uitgever:8000", "url_andere_oorsprong"),
+        ("ftp://uitgever:8000/x", "http://uitgever:8000", "url_schema_ongeldig"),
+    ]:
+        with pytest.raises(BronFout) as info:
+            ophaler.controleer_url(url, iss)
+        assert info.value.reden == reden
+    streng = Ophaler(False, frozenset({"uitgever"}), httpx2.AsyncClient(transport=leeg))  # type: ignore[arg-type]
+    with pytest.raises(BronFout) as info:
+        streng.controleer_url("http://uitgever:8000/jwks.json", "http://uitgever:8000")
+    assert info.value.reden == "url_schema_ongeldig"
+    # De adrescontrole gebeurt bij het ophalen, na naamresolutie.
+    with pytest.raises(BronFout) as info:
+        _loop(streng.haal("https://uitgever:8000/jwks.json", "https://uitgever:8000", "*/*"))
+    assert (info.value.reden, info.value.klasse) == ("adres_niet_toegestaan", "ongeldig")
+    # Privé-adres van een host die niet op de lijst staat: ook met STA_HTTP_TOE geweigerd.
+    los = Ophaler(True, frozenset(), httpx2.AsyncClient(transport=leeg))  # type: ignore[arg-type]
+    with pytest.raises(BronFout) as info:
+        _loop(los.haal("http://uitgever:8000/x", "http://uitgever:8000", "*/*"))
+    assert info.value.reden == "adres_niet_toegestaan"
+
+
+def test_onbekende_host_is_netwerkfout(monkeypatch: pytest.MonkeyPatch) -> None:
+    def faal(host: str, *_a: object, **_k: object) -> list[object]:
+        raise bronnen.socket.gaierror(8, f"{host}: nodename nor servname provided")
+
+    monkeypatch.setattr(bronnen.socket, "getaddrinfo", faal)
+    ophaler = Ophaler(True, frozenset({"uitgever"}))
+    with pytest.raises(BronFout) as info:
+        _loop(ophaler.haal("http://uitgever:8000/x", "http://uitgever:8000", "*/*"))
+    assert (info.value.reden, info.value.klasse) == ("adres_onbekend", "netwerk")
+
+
+def test_trage_bron_valt_binnen_de_tijdslimiet_af(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bronnen, "TIMEOUT_S", 0.05)
+
+    async def traag(request: httpx2.Request) -> httpx2.Response:
+        await asyncio.sleep(0.5)
+        return httpx2.Response(200, json={})
+
+    ophaler = Ophaler(
+        True, frozenset({"localhost"}), httpx2.AsyncClient(transport=httpx2.MockTransport(traag))
+    )  # type: ignore[arg-type]
+    begin = time.monotonic()
+    with pytest.raises(BronFout) as info:
+        _loop(ophaler.haal(f"{ISS}/x", ISS, "*/*"))
+    assert (info.value.reden, info.value.klasse) == ("netwerkfout", "netwerk")
+    assert time.monotonic() - begin < 0.4
+
+
+def test_adres_publiek_toegestaan(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        bronnen.socket, "getaddrinfo", lambda host, *_a: [(0, 0, 0, "", ("93.184.216.34", 0))]
+    )
+    assert bronnen._adres_toegestaan("voorbeeld.nl", False, frozenset())
+    # Link-local (cloudmetadata), shared address space en andere niet-publieke adressen: nooit.
+    nooit = ("169.254.169.254", "100.64.0.1", "fe80::1", "0.1.2.3", "192.0.0.8")
+    for adres in (*nooit, "224.0.0.1", "239.1.2.3", "ff02::1", "ff0e::1"):
+        monkeypatch.setattr(
+            bronnen.socket,
+            "getaddrinfo",
+            lambda host, *_a, adres=adres: [(0, 0, 0, "", (adres, 0))],
+        )
+        assert not bronnen._adres_toegestaan("meta", True, frozenset({"meta"})), adres
+        assert not bronnen._adres_toegestaan("meta", False, frozenset({"meta"})), adres
+    # RFC 1918 en loopback alleen in de demomodus én voor een host op de vertrouwenslijst.
+    monkeypatch.setattr(
+        bronnen.socket, "getaddrinfo", lambda host, *_a: [(0, 0, 0, "", ("127.0.0.1", 0))]
+    )
+    assert bronnen._adres_toegestaan("uitgever", True, frozenset({"uitgever"}))
+    assert not bronnen._adres_toegestaan("uitgever", True, frozenset({"ander"}))
+    assert not bronnen._adres_toegestaan("uitgever", False, frozenset({"uitgever"}))
+
+
+def test_antwoord_te_groot(tmp_path: Path) -> None:
+    groot = httpx2.MockTransport(
+        lambda r: httpx2.Response(200, content=b"x" * (bronnen.MAX_ANTWOORD + 1))
+    )
+    ophaler = Ophaler(True, frozenset({"localhost"}), httpx2.AsyncClient(transport=groot))  # type: ignore[arg-type]
+    with pytest.raises(BronFout) as info:
+        _loop(ophaler.haal(f"{ISS}/jwks.json", ISS, "application/json"))
+    assert info.value.reden == "antwoord_te_groot"
+
+
+def test_vertrouwenslijst_laden(tmp_path: Path) -> None:
+    pad = tmp_path / "lijst.json"
+    pad.write_text('[{"iss": "http://uitgever:8000/", "naam": "L", "vct": ["a"]}]')
+    lijst = Vertrouwenslijst.laad(pad)
+    assert lijst.uitgever("http://uitgever:8000") is not None
+    assert lijst.hosts == frozenset({"uitgever"})
+    pad.write_text('[{"iss": "uitgever", "vct": []}]')
+    with pytest.raises(ValueError, match="http"):
+        Vertrouwenslijst.laad(pad)
+
+
+def test_nonces_eenmalig(tmp_path: Path) -> None:
+    nonces = Nonces(tmp_path / "n.db")
+    n = nonces.nieuw()
+    assert nonces.verbruik(n)
+    assert not nonces.verbruik(n)
+    assert not nonces.verbruik("onbekend")
+
+
+def test_cachehit_controleert_oorsprong(
+    tmp_path: Path, uitgever_client: TestClient, uitgever: Dienst, uitgever_transport: Any
+) -> None:
+    """Een credential van uitgever B mag niet naar de gecachete lijst van uitgever A wijzen."""
+    v = _verificatie(tmp_path, uitgever_transport)
+    agent = _agent(uitgever_client, uitgever)
+    uri = f"{ISS}/statuslijsten/1"
+    _loop(v.statusbron.ververs(uri, LINDEVOORT))
+    ander = Uitgever("http://elsweerd:8000", "E", frozenset({VCT}))
+    with pytest.raises(BronFout) as info:
+        _loop(v.statusbron.status(uri, _idx(agent), ander))
+    assert info.value.reden == "url_andere_oorsprong"
+
+
+def test_nonce_verloopt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    nonces = Nonces(tmp_path / "n.db")
+    n = nonces.nieuw()
+    echte_tijd = time.time
+    monkeypatch.setattr("mandaatbewijs.verifier.nonces.time.time", lambda: echte_tijd() + 61)
+    assert not nonces.verbruik(n)
+
+
+def _jwks_ophaler(antwoord: Any, teller: dict[str, int]) -> Ophaler:
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        teller[request.url.path] = teller.get(request.url.path, 0) + 1
+        return antwoord(request)
+
+    return Ophaler(
+        True, frozenset({"localhost"}), httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+    )  # type: ignore[arg-type]
+
+
+def test_jwks_koude_start_haalt_eenmaal_op_bij_gelijktijdige_aanvragen() -> None:
+    sleutel = Sleutelpaar.nieuw("k1")
+    teller: dict[str, int] = {}
+
+    async def traag(request: httpx2.Request) -> httpx2.Response:
+        await asyncio.sleep(0.05)
+        return httpx2.Response(200, json={"issuer": ISS, "jwks": {"keys": [sleutel.jwks_lid]}})
+
+    bron = Sleutelbron(_jwks_ophaler(traag, teller))
+
+    async def acht() -> list[Any]:
+        return await asyncio.gather(*(bron.sleutel(LINDEVOORT, "k1") for _ in range(8)))
+
+    uitkomsten = _loop(acht())
+    assert all(s.thumbprint() == sleutel.jkt for s in uitkomsten)
+    assert teller["/.well-known/jwt-vc-issuer"] == 1
+
+
+def test_jwks_mislukte_pogingen_worden_begrensd_en_no_store_wordt_niet_bewaard() -> None:
+    sleutel = Sleutelpaar.nieuw("k1")
+    teller: dict[str, int] = {}
+    toestand = {"kapot": True}
+
+    def antwoord(request: httpx2.Request) -> httpx2.Response:
+        if toestand["kapot"]:
+            return httpx2.Response(503)
+        return httpx2.Response(
+            200,
+            json={"issuer": ISS, "jwks": {"keys": [sleutel.jwks_lid]}},
+            headers={"cache-control": "no-store"},
+        )
+
+    bron = Sleutelbron(_jwks_ophaler(antwoord, teller))
+    for _ in range(5):
+        with pytest.raises(BronFout):
+            _loop(bron.sleutel(LINDEVOORT, "k1"))
+    assert teller["/.well-known/jwt-vc-issuer"] == 1  # zonder cache toch hoogstens eens per 10 s
+    bron._caches[ISS].laatste_poging = 0
+    toestand["kapot"] = False
+    assert _loop(bron.sleutel(LINDEVOORT, "k1")).thumbprint() == sleutel.jkt
+    assert teller["/.well-known/jwt-vc-issuer"] == 2
+    # `no-store` op inline jwks: alleen voor die ene aanvraag; niets bewaard voor de volgende.
+    assert bron._caches[ISS].sleutels == {}
+    with pytest.raises(BronFout) as info:
+        _loop(bron.sleutel(LINDEVOORT, "k1"))
+    assert (info.value.reden, info.value.klasse) == ("jwks_niet_beschikbaar", "netwerk")
+    assert teller["/.well-known/jwt-vc-issuer"] == 2
+
+
+def test_metadata_met_jwks_en_jwks_uri_of_zonder_json_is_onjuist() -> None:
+    sleutel = Sleutelpaar.nieuw("k1")
+    beide = {"issuer": ISS, "jwks": {"keys": [sleutel.jwks_lid]}, "jwks_uri": f"{ISS}/jwks.json"}
+    bron = Sleutelbron(_jwks_ophaler(lambda r: httpx2.Response(200, json=beide), {}))
+    with pytest.raises(BronFout) as info:
+        _loop(bron.sleutel(LINDEVOORT, "k1"))
+    assert info.value.reden == "uitgever_metadata_onjuist"
+    bron = Sleutelbron(_jwks_ophaler(lambda r: httpx2.Response(200, text="<html>"), {}))
+    with pytest.raises(BronFout) as info:
+        _loop(bron.sleutel(LINDEVOORT, "k1"))
+    assert info.value.reden == "uitgever_metadata_onjuist"
+
+    def jwks_rommel(request: httpx2.Request) -> httpx2.Response:
+        if request.url.path.endswith("jwt-vc-issuer"):
+            return httpx2.Response(200, json={"issuer": ISS, "jwks_uri": f"{ISS}/jwks.json"})
+        return httpx2.Response(200, text="niet json")
+
+    bron = Sleutelbron(_jwks_ophaler(jwks_rommel, {}))
+    with pytest.raises(BronFout) as info:
+        _loop(bron.sleutel(LINDEVOORT, "k1"))
+    assert info.value.reden == "jwks_ongeldig"
+
+
+def test_te_groot_statusantwoord_maakt_de_cache_onbruikbaar(
+    tmp_path: Path, uitgever_client: TestClient, uitgever: Dienst, uitgever_transport: Any
+) -> None:
+    v = _verificatie(tmp_path, uitgever_transport)
+    agent = _agent(uitgever_client, uitgever)
+    uri = f"{ISS}/statuslijsten/1"
+    idx = _idx(agent)
+    _loop(v.statusbron.ververs(uri, LINDEVOORT))
+    time.sleep(1.1)
+    groot = httpx2.MockTransport(
+        lambda r: httpx2.Response(
+            200,
+            content=b"x" * (bronnen.MAX_ANTWOORD + 1),
+            headers={"content-type": "application/statuslist+jwt"},
+        )
+    )
+    v.statusbron.ophaler.client = httpx2.AsyncClient(transport=groot)  # type: ignore[arg-type]
+    with pytest.raises(BronFout) as info:
+        _loop(v.statusbron.status(uri, idx, LINDEVOORT))
+    assert (info.value.reden, info.value.klasse) == ("status_onbekend", "ongeldig")
+    weg = httpx2.MockTransport(lambda r: (_ for _ in ()).throw(httpx2.ConnectError("weg")))
+    v.statusbron.ophaler.client = httpx2.AsyncClient(transport=weg)  # type: ignore[arg-type]
+    with pytest.raises(BronFout) as info:
+        _loop(v.statusbron.status(uri, idx, LINDEVOORT))
+    assert info.value.reden == "status_onbekend"  # geen overbrugging na een ongeldig antwoord
+
+
+def test_ouder_statustoken_overschrijft_nieuwer_niet(
+    tmp_path: Path, uitgever_client: TestClient, uitgever: Dienst, uitgever_transport: Any
+) -> None:
+    """Een vertraagde, oudere download vervangt een al gecachet nieuwer token niet."""
+    v = _verificatie(tmp_path, uitgever_transport)
+    sleutel = Sleutelpaar.nieuw("agent")
+    serialisatie, mandaat_id = verleen(uitgever_client, uitgever, sleutel)
+    agent = Portemonnee(sleutel, ISS, Credential.uit_serialisatie(serialisatie))
+    uri = f"{ISS}/statuslijsten/1"
+    idx = _idx(agent)
+    oud_tekst = uitgever_client.get(uri).text  # token vóór de intrekking (bit 0)
+    time.sleep(1.1)
+    uitgever_client.delete(f"/mandaten/{mandaat_id}", auth=login(uitgever, "sanne"))
+    assert _loop(v.statusbron.status(uri, idx, LINDEVOORT)).waarde == 1
+    cache = v.statusbron._caches[uri]
+    assert cache.token is not None
+    nieuw_iat = cache.token.iat
+    # Nu komt (alsnog) het oudere token binnen: de cache houdt het nieuwere, de bit blijft 1.
+    cache.opgehaald = 0
+    oud = httpx2.MockTransport(
+        lambda r: httpx2.Response(
+            200, text=oud_tekst, headers={"content-type": "application/statuslist+jwt"}
+        )
+    )
+    v.statusbron.ophaler.client = httpx2.AsyncClient(transport=oud)  # type: ignore[arg-type]
+    uitkomst = _loop(v.statusbron.status(uri, idx, LINDEVOORT))
+    # Het oudere token bevestigt de cache niet: geen `vers`, maar overbrugging tot exp.
+    assert (uitkomst.waarde, uitkomst.bron) == (1, "cache-verouderd")
+    assert cache.token.iat == nieuw_iat
+    assert cache.opgehaald == 0
+
+
+def test_gelijktijdige_statusverversingen_halen_eenmaal_op(
+    tmp_path: Path, uitgever_client: TestClient, uitgever: Dienst
+) -> None:
+    teller = {"n": 0}
+    lijst_token = uitgever_client.get(f"{ISS}/statuslijsten/1").text
+    jwks = uitgever_client.get(f"{ISS}/jwks.json").json()
+
+    async def antwoord(request: httpx2.Request) -> httpx2.Response:
+        if request.url.path.endswith("jwt-vc-issuer"):
+            return httpx2.Response(200, json={"issuer": ISS, "jwks": jwks})
+        teller["n"] += 1
+        await asyncio.sleep(0.05)
+        return httpx2.Response(
+            200, text=lijst_token, headers={"content-type": "application/statuslist+jwt"}
+        )
+
+    v = _verificatie(tmp_path, httpx2.MockTransport(antwoord))
+    uri = f"{ISS}/statuslijsten/1"
+
+    async def acht() -> None:
+        await asyncio.gather(*(v.statusbron.ververs(uri, LINDEVOORT) for _ in range(8)))
+
+    _loop(acht())
+    assert teller["n"] == 1
+
+
+class _Klok:
+    """Instelbare `time.time` voor bron- en statuslijstcode."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, nu: float) -> None:
+        self.nu = nu
+        monkeypatch.setattr(time, "time", lambda: self.nu)
+
+
+STATUS_URI = f"{ISS}/statuslijsten/1"
+
+
+def _statustoken(sleutel: Sleutelpaar, bit: int, iat: int, exp: int, ttl: int = 5) -> str:
+    lijst = Statuslijst.leeg(16)
+    lijst.zet(3, bit)
+    return maak_token(sleutel, STATUS_URI, lijst, Tokenbeleid(ttl, exp - iat), nu=iat)
+
+
+def _statusbron(sleutel: Sleutelpaar, huidig: dict[str, str]) -> Statusbron:
+    """Statusbron waarvan de uitgever `huidig["token"]` serveert; JWKS lang gecachet."""
+
+    def antwoord(request: httpx2.Request) -> httpx2.Response:
+        if request.url.path.endswith("jwt-vc-issuer"):
+            return httpx2.Response(
+                200,
+                json={"issuer": ISS, "jwks": {"keys": [sleutel.jwks_lid]}},
+                headers={"cache-control": "max-age=100000"},
+            )
+        return httpx2.Response(
+            200, text=huidig["token"], headers={"content-type": "application/statuslist+jwt"}
+        )
+
+    ophaler = Ophaler(
+        True, frozenset({"localhost"}), httpx2.AsyncClient(transport=httpx2.MockTransport(antwoord))
+    )  # type: ignore[arg-type]
+    return Statusbron(ophaler, Sleutelbron(ophaler))
+
+
+def _status_fout(bron: Statusbron) -> BronFout:
+    with pytest.raises(BronFout) as info:
+        _loop(bron.status(STATUS_URI, 3, LINDEVOORT))
+    return info.value
+
+
+def test_ouder_token_draait_een_intrekking_niet_terug_ook_niet_na_een_ongeldig_antwoord(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleutel = Sleutelpaar.nieuw("u1")
+    klok = _Klok(monkeypatch, 1000)
+    huidig = {"token": _statustoken(sleutel, 1, iat=950, exp=2000)}
+    bron = _statusbron(sleutel, huidig)
+    assert _loop(bron.status(STATUS_URI, 3, LINDEVOORT)).waarde == 1
+    huidig["token"] = "a.b.c"  # ongeldig antwoord: cache onbruikbaar
+    klok.nu = 1006
+    assert _status_fout(bron).klasse == "ongeldig"
+    # Een geldig getekend maar ouder token met bit 0 herstelt de cache niet.
+    huidig["token"] = _statustoken(sleutel, 0, iat=900, exp=2000)
+    assert _status_fout(bron).reden == "status_onbekend"
+    cache = bron._caches[STATUS_URI]
+    assert cache.token is not None
+    assert cache.token.iat == 950
+    assert cache.onbruikbaar
+    # Pas een nieuwer token maakt de cache weer bruikbaar.
+    huidig["token"] = _statustoken(sleutel, 1, iat=1006, exp=2000)
+    assert _loop(bron.status(STATUS_URI, 3, LINDEVOORT)) == bronnen.Statusuitkomst(1, "vers")
+
+
+def test_tegenstrijdig_token_met_dezelfde_iat_maakt_de_cache_onbruikbaar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleutel = Sleutelpaar.nieuw("u1")
+    klok = _Klok(monkeypatch, 1000)
+    huidig = {"token": _statustoken(sleutel, 1, iat=1000, exp=2000)}
+    bron = _statusbron(sleutel, huidig)
+    assert _loop(bron.status(STATUS_URI, 3, LINDEVOORT)).waarde == 1
+    # Hetzelfde token opnieuw (zelfde iat, zelfde lijst) bevestigt de cache gewoon.
+    klok.nu = 1006
+    assert _loop(bron.status(STATUS_URI, 3, LINDEVOORT)) == bronnen.Statusuitkomst(1, "vers")
+    # Zelfde iat, andere lijst (bit 1 → 0): geweigerd, en daarna geen overbrugging.
+    huidig["token"] = _statustoken(sleutel, 0, iat=1000, exp=2000)
+    klok.nu = 1012
+    fout = _status_fout(bron)
+    assert (fout.reden, fout.klasse) == ("status_onbekend", "ongeldig")
+    assert "statustoken_tegenstrijdig" in str(fout)
+    # Ook het oorspronkelijke token (zelfde iat) herstelt de cache niet; alleen een nieuwer.
+    huidig["token"] = _statustoken(sleutel, 1, iat=1000, exp=2000)
+    assert _status_fout(bron).reden == "status_onbekend"
+    huidig["token"] = _statustoken(sleutel, 1, iat=1012, exp=2000)
+    assert _loop(bron.status(STATUS_URI, 3, LINDEVOORT)).waarde == 1
+
+
+def test_ouder_token_bevestigt_een_verlopen_cache_niet(monkeypatch: pytest.MonkeyPatch) -> None:
+    sleutel = Sleutelpaar.nieuw("u1")
+    klok = _Klok(monkeypatch, 1000)
+    huidig = {"token": _statustoken(sleutel, 1, iat=950, exp=1010, ttl=1)}
+    bron = _statusbron(sleutel, huidig)
+    assert _loop(bron.status(STATUS_URI, 3, LINDEVOORT)).waarde == 1
+    huidig["token"] = _statustoken(sleutel, 0, iat=900, exp=2000)
+    # ttl om, exp niet: het oudere token telt als mislukte verversing, overbrugging tot exp.
+    klok.nu = 1005
+    assert _loop(bron.status(STATUS_URI, 3, LINDEVOORT)) == bronnen.Statusuitkomst(
+        1, "cache-verouderd"
+    )
+    assert bron._caches[STATUS_URI].opgehaald == 1000
+    # exp van het gecachete token voorbij: geen uitkomst uit het verlopen token, en zeker geen
+    # `vers` met de bit uit het oudere token.
+    klok.nu = 1010
+    assert _status_fout(bron).reden == "status_onbekend"
+
+
+def test_jwks_verlopen_sleutel_blijft_na_mislukte_verversing_onbruikbaar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleutel = Sleutelpaar.nieuw("k1")
+    teller: dict[str, int] = {}
+    toestand = {"kapot": False}
+    klok = _Klok(monkeypatch, 1000)
+
+    def antwoord(request: httpx2.Request) -> httpx2.Response:
+        if toestand["kapot"]:
+            return httpx2.Response(503)
+        return httpx2.Response(
+            200,
+            json={"issuer": ISS, "jwks": {"keys": [sleutel.jwks_lid]}},
+            headers={"cache-control": "max-age=5"},
+        )
+
+    bron = Sleutelbron(_jwks_ophaler(antwoord, teller))
+    assert _loop(bron.sleutel(LINDEVOORT, "k1")).thumbprint() == sleutel.jkt
+    klok.nu = 1004
+    assert _loop(bron.sleutel(LINDEVOORT, "k1")).thumbprint() == sleutel.jkt  # uit de cache
+    toestand["kapot"] = True
+    # Elke 11 s een mislukte verversing, steeds gevolgd door een aanvraag een seconde later: de
+    # verlopen sleutel komt nooit terug, ook niet doordat de downloadrem de poging begrenst.
+    for poging in (1011, 1022):
+        klok.nu = poging
+        with pytest.raises(BronFout) as info:
+            _loop(bron.sleutel(LINDEVOORT, "k1"))
+        assert (info.value.reden, info.value.klasse) == ("http_status", "netwerk")
+        klok.nu = poging + 1
+        with pytest.raises(BronFout) as info:
+            _loop(bron.sleutel(LINDEVOORT, "k1"))
+        assert (info.value.reden, info.value.klasse) == ("jwks_niet_beschikbaar", "netwerk")
+    assert teller["/.well-known/jwt-vc-issuer"] == 3  # 1000, 1011, 1022: één per 10 s

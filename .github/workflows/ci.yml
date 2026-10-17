@@ -1,0 +1,60 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  kwaliteit:
+    name: lint, typen en unittests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.13.1"
+      - run: uv sync --frozen --group dev --all-extras
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run ty check src tests
+      - run: uv run pytest -m "not integratie"
+
+  keten:
+    name: integratietests en demo tegen de compose-keten
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Demo-omgeving
+        run: cp .env.example .env
+      - name: Keten starten
+        run: docker compose up -d --build --wait
+      - name: Integratietests
+        run: docker compose run --rm tests
+      - name: Demo (alle zes de scenario's)
+        run: docker compose run --rm demo
+      - name: Logs bij falen
+        if: failure()
+        run: docker compose logs --no-color | tail -300
+      - name: Opruimen
+        if: always()
+        run: docker compose down -v
+
+  geheimen:
+    name: geheimenscan (gitleaks)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: gitleaks
+        run: |
+          docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f \
+            git /repo --redact --verbose
