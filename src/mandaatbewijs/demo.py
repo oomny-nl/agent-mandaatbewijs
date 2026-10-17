@@ -59,6 +59,13 @@ def zeg(rol: str, tekst: str, stijl: str = "") -> None:
         time.sleep(VERTRAGING)
 
 
+def scenariokop(titel: str) -> None:
+    """Scenariokop; met DEMO_TEMPO eerst een pauze zodat de kijker de vorige uitkomst leest."""
+    if VERTRAGING:
+        time.sleep(VERTRAGING * 8)
+    console.rule(f"[bold]{titel}")
+
+
 GEBEURTENISSEN: list[dict[str, Any]] = []
 # Gebeurtenissen die een beslissing van register of uitgever weergeven; `verwacht` vergelijkt die
 # per scenario één op één met de verwachting.
@@ -265,7 +272,7 @@ async def _opdracht(regie: Regie, agent: Portemonnee, dossier: str) -> None:
 
 async def scenario_toegestaan(regie: Regie) -> Portemonnee:
     """Scenario 1: binnen mandaat, bij een andere organisatie."""
-    console.rule("[bold]1. Toegestaan: de assistent werkt bij het inkomensregister binnen mandaat")
+    scenariokop("1. Toegestaan: de assistent werkt bij het inkomensregister binnen mandaat")
     agent = regie.agent()
     regie.verleen(agent, ["2026-0142"])
     await _opdracht(regie, agent, "2026-0142")
@@ -277,7 +284,7 @@ async def scenario_toegestaan(regie: Regie) -> Portemonnee:
 
 async def scenario_buiten_mandaat(regie: Regie) -> None:
     """Scenario 2: een ingevoegde instructie kaapt de (gesimuleerde) agent; de grens houdt."""
-    console.rule("[bold]2. Buiten mandaat: een instructie in het dossier kaapt de assistent")
+    scenariokop("2. Buiten mandaat: een instructie in het dossier kaapt de assistent")
     agent = regie.agent("assistent-2")
     regie.verleen(agent, ["2026-0143"])
     zeg(
@@ -322,7 +329,7 @@ async def _rauwe_aanroep(regie: Regie, presentatie: str, dossier: str) -> tuple[
 
 async def scenario_replay(regie: Regie, agent: Portemonnee) -> None:
     """Scenario 3: een afgevangen presentatie opnieuw sturen, en met een andere sleutel."""
-    console.rule("[bold]3. Replay: een afgevangen presentatie wordt opnieuw gebruikt")
+    scenariokop("3. Replay: een afgevangen presentatie wordt opnieuw gebruikt")
     async with AsyncExitStack() as stack:
         gereedschap, _ = await _met_agent(regie, agent, stack)
         await gereedschap.voer_uit("inkomen_opvragen", {"dossier": "2026-0142"})
@@ -374,7 +381,7 @@ async def _tot_geweigerd(gereedschap: Gereedschap, dossier: str, max_s: float) -
 
 async def scenario_ingetrokken(regie: Regie) -> None:
     """Scenario 4: Sanne trekt in; het register weigert binnen het cache-interval."""
-    console.rule("[bold]4. Ingetrokken: Sanne trekt in, het register weigert via de statuslijst")
+    scenariokop("4. Ingetrokken: Sanne trekt in, het register weigert via de statuslijst")
     agent = regie.agent("assistent-4")
     toestemming = regie.verleen(agent, ["2026-0142"])
     async with AsyncExitStack() as stack:
@@ -397,7 +404,7 @@ async def scenario_ingetrokken(regie: Regie) -> None:
 
 async def scenario_niet_vertrouwd(regie: Regie) -> None:
     """Scenario 5: een mandaat van een uitgever die niet op de vertrouwenslijst staat."""
-    console.rule("[bold]5. Niet vertrouwd: gemeente Elsweerd geeft een mandaat uit")
+    scenariokop("5. Niet vertrouwd: gemeente Elsweerd geeft een mandaat uit")
     elsweerd = Sleutelpaar.nieuw("elsweerd-1")
     agent = regie.agent("assistent-5")
     nu = int(time.time())
@@ -431,7 +438,7 @@ async def scenario_niet_vertrouwd(regie: Regie) -> None:
 
 async def scenario_noodstop(regie: Regie) -> None:
     """Scenario 6: Kees blokkeert de agentsleutel; een nieuwe sleutel krijgt een nieuw mandaat."""
-    console.rule("[bold]6. Noodstop: de beheerder blokkeert de agentsleutel")
+    scenariokop("6. Noodstop: de beheerder blokkeert de agentsleutel")
     agent = regie.agent("assistent-6")
     regie.verleen(agent, ["2026-0142"])
     async with AsyncExitStack() as stack:
@@ -497,7 +504,7 @@ def _voeg_toe(tabel: Table, rij: tuple[str, ...] | None, herhaald: int) -> None:
 
 def bewijstabel(paden: dict[str, Path]) -> None:
     """Toon beide auditlogs als één bewijstabel; controleer de ketens (faalt bij afwijking)."""
-    console.rule("[bold]Bewijs: auditlogs van uitgever en register (hashketens)")
+    scenariokop("Bewijs: auditlogs van uitgever en register (hashketens)")
     alles: list[dict[str, Any]] = []
     samenvatting = []
     for naam, pad in paden.items():

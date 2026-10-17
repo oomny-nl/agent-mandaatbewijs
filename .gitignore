@@ -26,3 +26,6 @@ data/
 
 # OS
 .DS_Store
+
+# Tussenproduct van make opname; de README toont docs/beeld/demo.gif
+demo/demo.mp4
