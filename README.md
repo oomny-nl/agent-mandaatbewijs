@@ -82,13 +82,13 @@ sequenceDiagram
 
     A->>U: POST /mandaatverzoeken (publieke sleutel, doel, acties, dossiers)
     S->>U: toestemmingsscherm: ja, 10 minuten
-    U->>U: caseload en rol van Sanne; status-index toewijzen
+    U->>U: caseload en rol van Sanne, status-index toewijzen
     A->>U: POST /mandaatverzoeken/id/credential met bewijs van sleutelbezit
     U-->>A: SD-JWT VC: cnf = sleutel agent, status = lijst + index, disclosures per claim
     loop per toolaanroep
         A->>R: POST /nonces
         R-->>A: nonce (60 s, eenmalig)
-        A->>A: kies disclosures: doel, één actie, één dossier; KB-JWT met aud en nonce
+        A->>A: kies disclosures: doel, één actie, één dossier, KB-JWT met aud en nonce
         A->>R: tools/call met Authorization: Mandaat <presentatie>
         R->>R: vertrouwenslijst, JWKS (cache), handtekeningen, nonce, statuslijst (cache), bereik
         R-->>A: resultaat, of 401/403 met de reden

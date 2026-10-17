@@ -81,13 +81,13 @@ sequenceDiagram
 
     A->>U: POST /mandaatverzoeken (public key, purpose, actions, cases)
     S->>U: consent screen: yes, 10 minutes
-    U->>U: Sanne's caseload and role; assign status index
+    U->>U: Sanne's caseload and role, assign status index
     A->>U: POST /mandaatverzoeken/id/credential with proof of possession
     U-->>A: SD-JWT VC: cnf = agent key, status = list + index, one disclosure per claim
     loop per tool call
         A->>R: POST /nonces
         R-->>A: nonce (60 s, single use)
-        A->>A: choose disclosures: purpose, one action, one case; KB-JWT with aud and nonce
+        A->>A: choose disclosures: purpose, one action, one case, KB-JWT with aud and nonce
         A->>R: tools/call with Authorization: Mandaat <presentation>
         R->>R: trust list, JWKS (cache), signatures, nonce, status list (cache), scope
         R-->>A: result, or 401/403 with the reason
