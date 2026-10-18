@@ -468,10 +468,12 @@ aanroep schuift de grens, net als bij een onbereikbare uitgever, op tot `exp`. W
 T + `ttl` wil houden, zet grace voor de statuslijst op nul (de demo slaagt achter Varnish 7.7 met
 `default_grace=0` en faalt met de standaard van 10 seconden). Door de afrondingsseconde en de
 transporttijd kan bij `max-age` gelijk aan `ttl` ook een niet-verlopen antwoord (tot
-`Age: ttl - 1`) bij aankomst als te oud tellen; het auditrecord meldt dan `cache-verouderd`. Dat
-raakt alleen een download die vóór T + `ttl` begon: een cache zonder grace die de `max-age` van
-de uitgever volgt, levert vanaf T + `ttl` alleen antwoorden die na T zijn opgeslagen. Wie op zo'n
-download wachtte maar pas na het begin ervan aanvroeg, deelt die uitkomst niet en haalt zelf op.
+`Age: ttl - 1`) bij aankomst als te oud tellen; het auditrecord meldt dan `cache-verouderd`.
+Toelating met de oude status kan dan alleen via een download die vóór T + `ttl` begon: een cache
+zonder grace die de `max-age` van de uitgever volgt, levert vanaf T + `ttl` alleen antwoorden die
+na T zijn opgeslagen. Een later begonnen download kan hetzelfde label krijgen, maar draagt dan de
+intrekking en wordt geweigerd. Wie op een eerder begonnen download wachtte maar pas na het begin
+ervan aanvroeg, deelt die uitkomst niet en haalt zelf op.
 Zo ziet ook een aanroep die precies op T + `ttl` begint terwijl een eerdere download nog loopt,
 de intrekking. Een aanroep die eerder begint, kan nog worden toegelaten; de achtergrondverversing
 maakt dat venster in de praktijk korter, maar de grens volgt uit de cacheregel en niet uit die
