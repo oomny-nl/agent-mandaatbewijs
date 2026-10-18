@@ -17,7 +17,7 @@ from mandaatbewijs.statuslijst import INGETROKKEN, MEDIATYPE, Tokenbeleid, lees_
 from mandaatbewijs.uitgever import register
 from mandaatbewijs.uitgever.app import Dienst, Instellingen, maak_app
 from mandaatbewijs.uitgever.gegevens import VCT
-from tests.unit.conftest import ISS, audit, login, proof, verleen
+from tests.unit.conftest import ISS, VolVolume, audit, login, proof, verleen
 
 
 def test_metadata_en_jwks(uitgever_client: TestClient, uitgever: Dienst) -> None:
@@ -430,6 +430,58 @@ def test_uitgifte_en_auditevent_zijn_atomair_bij_uitval_van_het_log(
     assert records[1]["mandaat"] == t.json()["mandaat_id"]
     assert controleer(records) == (True, "intact")
     assert uitgever.register.uitgaand() == []
+
+
+def test_half_geschreven_auditregel_gaat_niet_verloren_en_breekt_de_herstart_niet(
+    uitgever_client: TestClient, uitgever: Dienst, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vol volume midden in een append: terugzetten, event in de outbox, later één keer."""
+    sleutel = Sleutelpaar.nieuw()
+    v = _verzoek(uitgever_client, sleutel)
+    grens = VolVolume(monkeypatch, uitgever.audit.pad, deel=20)
+    t = uitgever_client.post(
+        f"/mandaatverzoeken/{v['id']}/toestemming",
+        json={"besluit": "ja", "geldigheid_s": 300},
+        auth=login(uitgever, "sanne"),
+    )
+    assert t.status_code == 200
+    assert [e["gebeurtenis"] for _, e in uitgever.register.uitgaand()] == ["uitgegeven"]
+    assert [r["gebeurtenis"] for r in audit(uitgever)] == ["verzoek"]  # geen halve regel
+    grens.actief = False
+    c = uitgever_client.post(
+        f"/mandaatverzoeken/{v['id']}/credential", json={"proof": proof(sleutel, str(v["id"]))}
+    )
+    assert c.status_code == 200
+    herstart = Dienst(uitgever.inst)
+    maak_app(herstart)
+    records = audit(herstart)
+    assert [r["gebeurtenis"] for r in records] == ["verzoek", "uitgegeven", "opgehaald"]
+    assert controleer(records) == (True, "intact")
+    assert herstart.register.uitgaand() == []
+
+
+def test_vertraagde_aflevering_behoudt_de_gebeurtenistijd(
+    uitgever_client: TestClient, uitgever: Dienst, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`tijd` is het moment van de mutatie (in de outbox), `geschreven` dat van de aflevering."""
+    sleutel = Sleutelpaar.nieuw()
+    v = _verzoek(uitgever_client, sleutel)
+    mutatie = "2000-01-01T00:00:00.000+00:00"
+    monkeypatch.setattr(register, "nu_iso", lambda: mutatie)
+    grens = VolVolume(monkeypatch, uitgever.audit.pad, deel=0)
+    uitgever_client.post(
+        f"/mandaatverzoeken/{v['id']}/toestemming",
+        json={"besluit": "ja", "geldigheid_s": 300},
+        auth=login(uitgever, "sanne"),
+    )
+    assert [e["tijd"] for _, e in uitgever.register.uitgaand()] == [mutatie]
+    grens.actief = False
+    uitgever.verwerk_uitgaand(strikt=True)
+    uitgegeven = audit(uitgever)[1]
+    assert uitgegeven["gebeurtenis"] == "uitgegeven"
+    assert uitgegeven["tijd"] == mutatie
+    assert uitgegeven["geschreven"] > mutatie
+    assert controleer(audit(uitgever)) == (True, "intact")
 
 
 def test_herstart_na_schrijven_maar_voor_opruimen_geeft_geen_dubbel_record(

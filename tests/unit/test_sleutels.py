@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import errno
 import os
 from pathlib import Path
 from typing import Any
@@ -80,14 +81,42 @@ def test_jose_kop_van_een_echte_jws() -> None:
     assert jose_kop(paar.teken({"typ": "x"}, {})) == {"alg": "ES256", "typ": "x", "kid": "u1"}
 
 
-def test_geheim_bestaat_vanaf_de_eerste_byte_met_rechten_0600(tmp_path: Path) -> None:
+def test_geheim_bestaat_vanaf_de_eerste_byte_met_rechten_0600(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """De rechten staan al op 0600 voordat er een byte geschreven is, ook met umask 0."""
+    echte_fdopen = os.fdopen
+    gezien: list[tuple[str, int]] = []
+
+    def fdopen(fd: int, *args: Any, **kwargs: Any) -> Any:
+        stat = os.fstat(fd)
+        gezien.append((oct(stat.st_mode & 0o777), stat.st_size))
+        return echte_fdopen(fd, *args, **kwargs)
+
+    monkeypatch.setattr(os, "fdopen", fdopen)
     oud = os.umask(0)
     try:
         assert maak_afgeschermd(tmp_path / "map" / "geheim", "inhoud")
     finally:
         os.umask(oud)
+    assert gezien == [("0o600", 0)]
     assert oct((tmp_path / "map" / "geheim").stat().st_mode & 0o777) == "0o600"
     assert [p.name for p in (tmp_path / "map").iterdir()] == ["geheim"]
+
+
+@pytest.mark.parametrize("stap", ["fsync", "link"])
+def test_afgebroken_aanmaak_laat_geen_geheim_en_geen_tijdelijk_bestand_achter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stap: str
+) -> None:
+    """Een fout vóór de publicatie (vol volume, I/O-fout) laat de map leeg achter."""
+
+    def faal(*_: Any) -> None:
+        raise OSError(errno.EIO, f"{stap} faalt")
+
+    monkeypatch.setattr(os, stap, faal)
+    with pytest.raises(OSError, match=f"{stap} faalt"):
+        maak_afgeschermd(tmp_path / "geheim", "inhoud")
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_bestaand_geheim_wordt_niet_overschreven(tmp_path: Path) -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 
 import httpx2
 import pytest
@@ -95,13 +96,17 @@ def test_gekaapte_agent_via_mcp_client(omgeving: Omgeving, verleen: Verlener) ->
     assert resultaten == ["dossier_lezen", "inkomen_opvragen"]
 
 
-def test_replay_en_gestolen_presentatie(omgeving: Omgeving, verleen: Verlener) -> None:
+def test_replay_en_gestolen_presentatie(
+    omgeving: Omgeving, verleen: Verlener, portemonnees: ExitStack
+) -> None:
     m = verleen(["2026-0142"])
     p = presentatie(omgeving, m.agent, "2026-0142")
     assert inkomen(aanroep(omgeving, p, "2026-0142"))
     opnieuw = aanroep(omgeving, p, "2026-0142")
     assert (opnieuw.status, opnieuw.reden) == (401, "nonce_onbekend_of_gebruikt")
-    dief = Portemonnee(Sleutelpaar.nieuw("dief"), omgeving.uitgever, m.agent.credential)
+    dief = portemonnees.enter_context(
+        Portemonnee(Sleutelpaar.nieuw("dief"), omgeving.uitgever, m.agent.credential)
+    )
     gestolen = aanroep(omgeving, presentatie(omgeving, dief, "2026-0142"), "2026-0142")
     assert (gestolen.status, gestolen.reden) == (401, "kb_handtekening_ongeldig")
     zonder = aanroep(omgeving, None, "2026-0142")
@@ -138,7 +143,7 @@ def test_ingetrokken_geen_toegang_meer_na_ttl(omgeving: Omgeving, verleen: Verle
     )
 
 
-def test_uitgever_niet_vertrouwd(omgeving: Omgeving) -> None:
+def test_uitgever_niet_vertrouwd(omgeving: Omgeving, portemonnees: ExitStack) -> None:
     elsweerd, agent = Sleutelpaar.nieuw("elsweerd-01"), Sleutelpaar.nieuw("agent")
     nu = int(time.time())
     claims = {
@@ -159,7 +164,9 @@ def test_uitgever_niet_vertrouwd(omgeving: Omgeving) -> None:
     serialisatie, _ = geef_uit(elsweerd, claims, set(VERBORGEN), set(PER_ELEMENT))
     from mandaatbewijs.sdjwt import Credential  # noqa: PLC0415
 
-    p = Portemonnee(agent, "http://elsweerd:8000", Credential.uit_serialisatie(serialisatie))
+    p = portemonnees.enter_context(
+        Portemonnee(agent, "http://elsweerd:8000", Credential.uit_serialisatie(serialisatie))
+    )
     u = aanroep(omgeving, presentatie(omgeving, p, "2026-0142"), "2026-0142")
     assert (u.status, u.reden) == (401, "uitgever_niet_vertrouwd")
     record = omgeving.audit("register")[-1]
@@ -186,8 +193,10 @@ def test_noodstop_blokkeert_sleutel(omgeving: Omgeving, verleen: Verlener) -> No
     assert inkomen(aanroep(omgeving, presentatie(omgeving, nieuw.agent, "2026-0142"), "2026-0142"))
 
 
-def test_toestemming_en_bevoegdheid_bij_de_uitgever(omgeving: Omgeving) -> None:
-    agent = Portemonnee(Sleutelpaar.nieuw("agent"), omgeving.uitgever)
+def test_toestemming_en_bevoegdheid_bij_de_uitgever(
+    omgeving: Omgeving, portemonnees: ExitStack
+) -> None:
+    agent = portemonnees.enter_context(Portemonnee(Sleutelpaar.nieuw("agent"), omgeving.uitgever))
     verzoek_id = agent.vraag_mandaat("sanne", "heronderzoek", ["inkomen:lezen"], ["2026-0157"])
     scherm = omgeving.portaal().scherm(verzoek_id)
     assert scherm["agent_jkt"] == agent.jkt

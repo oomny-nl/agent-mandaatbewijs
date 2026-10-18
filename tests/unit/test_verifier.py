@@ -754,7 +754,10 @@ def _statustoken(sleutel: Sleutelpaar, bit: int, iat: int, exp: int, ttl: int = 
 
 
 def _statusbron(sleutel: Sleutelpaar, huidig: dict[str, str]) -> Statusbron:
-    """Statusbron waarvan de uitgever `huidig["token"]` serveert; JWKS lang gecachet."""
+    """Statusbron waarvan de uitgever `huidig["token"]` serveert; JWKS lang gecachet.
+
+    Met `huidig["age"]` stuurt het antwoord die `Age`-header mee, zoals een HTTP-cache.
+    """
 
     def antwoord(request: httpx2.Request) -> httpx2.Response:
         if request.url.path.endswith("jwt-vc-issuer"):
@@ -763,9 +766,8 @@ def _statusbron(sleutel: Sleutelpaar, huidig: dict[str, str]) -> Statusbron:
                 json={"issuer": ISS, "jwks": {"keys": [sleutel.jwks_lid]}},
                 headers={"cache-control": "max-age=100000"},
             )
-        return httpx2.Response(
-            200, text=huidig["token"], headers={"content-type": "application/statuslist+jwt"}
-        )
+        kop = {**STATUS_KOP, **({"age": huidig["age"]} if "age" in huidig else {})}
+        return httpx2.Response(200, text=huidig["token"], headers=kop)
 
     ophaler = Ophaler(
         True, frozenset({"localhost"}), httpx2.AsyncClient(transport=httpx2.MockTransport(antwoord))
@@ -1073,6 +1075,11 @@ def test_gecomprimeerd_antwoord_valt_onder_de_grens_na_decompressie() -> None:
         ({"cache-control": "max-age=60", "age": "50"}, 10),
         ({"cache-control": "max-age=60", "age": "70"}, 0),
         ({"cache-control": "max-age=60", "age": "x"}, 0),
+        ({"cache-control": "max-age=60", "age": "5, 6"}, 0),  # twee Age-headers
+        ({"cache-control": "max-age=999999", "age": "100"}, 200),
+        ({"age": "290"}, 10),  # zonder max-age telt de ouderdom ook
+        ({"age": "400"}, 0),
+        ({"age": "x"}, 0),
         ({"cache-control": "max-age=abc"}, 0),
         ({"cache-control": "max-age=²".encode()}, 0),
         ({"cache-control": "max-age=-1"}, 0),
@@ -1083,3 +1090,161 @@ def test_gecomprimeerd_antwoord_valt_onder_de_grens_na_decompressie() -> None:
 def test_cacheduur_volgt_rfc_9111(headers: dict[str, Any], verwacht: int) -> None:
     antwoord = httpx2.Response(200, headers=headers)
     assert bronnen._cacheduur(antwoord, bronnen.JWKS_CACHE_S) == verwacht
+
+
+def test_dubbele_age_header_is_ongeldig() -> None:
+    antwoord = httpx2.Response(200, headers=[("age", "5"), ("age", "6")])
+    assert bronnen._leeftijd(antwoord) is None
+    assert bronnen._cacheduur(antwoord, bronnen.JWKS_CACHE_S) == 0
+
+
+def test_tussenliggende_http_cache_verlengt_het_intrekkingsvenster_niet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Een gedeelde HTTP-cache (RFC 9111 §4) bewaarde de lijst op 999; intrekking op T = 1000.
+
+    De cache levert dat oude antwoord met `Age` mee. De ouderdom telt mee: het antwoord is
+    bruikbaar tot 999 + ttl (1004), daarna haalt de verifier opnieuw op en moet de cache zelf naar
+    de uitgever. Zonder `Age` zou de oude lijst tot 1008 gelden, ruim na T + ttl (1005).
+    """
+    sleutel = Sleutelpaar.nieuw("u1")
+    klok = _Klok(monkeypatch, 1003)
+    uitgever = {"token": _statustoken(sleutel, 1, iat=1000, exp=1060)}  # na de intrekking
+    opgeslagen: dict[str, Any] = {
+        "tijd": 999.0,
+        "token": _statustoken(sleutel, 0, iat=999, exp=1059),
+    }
+
+    def http_cache(request: httpx2.Request) -> httpx2.Response:
+        if request.url.path.endswith("jwt-vc-issuer"):
+            return httpx2.Response(
+                200,
+                json={"issuer": ISS, "jwks": {"keys": [sleutel.jwks_lid]}},
+                headers={"cache-control": "max-age=100000"},
+            )
+        if klok.nu - opgeslagen["tijd"] >= 5:  # niet meer vers voor de cache: naar de uitgever
+            opgeslagen.update(tijd=klok.nu, token=uitgever["token"])
+        kop = {**STATUS_KOP, "cache-control": "max-age=5"}
+        return httpx2.Response(
+            200,
+            text=opgeslagen["token"],
+            headers={**kop, "age": str(int(klok.nu - opgeslagen["tijd"]))},
+        )
+
+    ophaler = Ophaler(
+        True,
+        frozenset({"localhost"}),
+        httpx2.AsyncClient(transport=httpx2.MockTransport(http_cache)),
+    )  # type: ignore[arg-type]
+    bron = Statusbron(ophaler, Sleutelbron(ophaler))
+    # 1003: het oude antwoord (Age 4) is nog vers; vóór T + ttl mag dat.
+    assert _loop(bron.status(STATUS_URI, 3, LINDEVOORT)) == bronnen.Statusuitkomst(0, "vers")
+    assert bron._caches[(ISS, STATUS_URI)].opgehaald == 999
+    klok.nu = 1003.75
+    assert _loop(bron.status(STATUS_URI, 3, LINDEVOORT)) == bronnen.Statusuitkomst(0, "cache")
+    for kwart in range(25):  # 1004 tot en met 1010: steeds de intrekking
+        klok.nu = 1004 + kwart / 4
+        assert _loop(bron.status(STATUS_URI, 3, LINDEVOORT)).waarde == 1
+
+
+def test_te_oud_antwoord_bewaart_de_intrekking_maar_telt_nooit_als_vers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleutel = Sleutelpaar.nieuw("u1")
+    klok = _Klok(monkeypatch, 995)
+    huidig = {"token": _statustoken(sleutel, 0, iat=990, exp=2000)}
+    bron = _statusbron(sleutel, huidig)
+    assert _loop(bron.status(STATUS_URI, 3, LINDEVOORT)) == bronnen.Statusuitkomst(0, "vers")
+    # Nieuwer token met de intrekking, maar via een cache al 6 s oud (ttl 5).
+    huidig.update(token=_statustoken(sleutel, 1, iat=1000, exp=2000), age="6")
+    klok.nu = 1001
+    assert _loop(bron.status(STATUS_URI, 3, LINDEVOORT)) == bronnen.Statusuitkomst(
+        1, "cache-verouderd"
+    )
+    cache = bron._caches[(ISS, STATUS_URI)]
+    assert cache.token is not None
+    assert cache.token.iat == 1000
+    assert cache.laatste_fout is not None
+    assert cache.laatste_fout.reden == "statusantwoord_verouderd"
+    # Pas een vers antwoord (zonder ouderdom) geeft weer `vers`.
+    del huidig["age"]
+    assert _loop(bron.status(STATUS_URI, 3, LINDEVOORT)) == bronnen.Statusuitkomst(1, "vers")
+
+
+@pytest.mark.parametrize("age", ["x", "-1", "5, 6"])
+def test_ongeldige_age_telt_als_verouderd(monkeypatch: pytest.MonkeyPatch, age: str) -> None:
+    sleutel = Sleutelpaar.nieuw("u1")
+    _Klok(monkeypatch, 1000)
+    bron = _statusbron(sleutel, {"token": _statustoken(sleutel, 1, iat=1000, exp=2000), "age": age})
+    assert _loop(bron.status(STATUS_URI, 3, LINDEVOORT)) == bronnen.Statusuitkomst(
+        1, "cache-verouderd"
+    )
+
+
+def test_hetzelfde_token_met_meer_ouderdom_verkort_de_cache_niet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleutel = Sleutelpaar.nieuw("u1")
+    klok = _Klok(monkeypatch, 1000)
+    huidig = {"token": _statustoken(sleutel, 0, iat=1000, exp=2000)}
+    bron = _statusbron(sleutel, huidig)
+    _loop(bron.ververs(STATUS_URI, LINDEVOORT))
+    huidig["age"] = "4"  # achtergrondverversing krijgt hetzelfde token uit een cache
+    klok.nu = 1002
+    _loop(bron.ververs(STATUS_URI, LINDEVOORT))
+    assert bron._caches[(ISS, STATUS_URI)].opgehaald == 1000
+
+
+def _jwks_bron(klok: _Klok, kop: dict[str, str], duur: float = 0.0) -> Sleutelbron:
+    sleutel = Sleutelpaar.nieuw("k1")
+
+    def antwoord(request: httpx2.Request) -> httpx2.Response:
+        klok.nu += duur
+        return httpx2.Response(
+            200, json={"issuer": ISS, "jwks": {"keys": [sleutel.jwks_lid]}}, headers=kop
+        )
+
+    return Sleutelbron(_jwks_ophaler(antwoord, {}))
+
+
+def test_jwks_grens_telt_age_en_transporttijd(monkeypatch: pytest.MonkeyPatch) -> None:
+    """RFC 9111 §4.2.3: de grens is begin van de aanvraag plus levensduur min `Age`."""
+    klok = _Klok(monkeypatch, 1000)
+    bron = _jwks_bron(klok, {"cache-control": "max-age=10", "age": "2"}, duur=3)
+    _loop(bron.sleutel(LINDEVOORT, "k1"))
+    assert bron._caches[ISS].geldig_tot == 1008
+
+
+def test_jwks_die_bij_aankomst_al_verlopen_is_wordt_niet_bewaard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    klok = _Klok(monkeypatch, 1000)
+    bron = _jwks_bron(klok, {"cache-control": "max-age=1"}, duur=4)
+    _loop(bron.sleutel(LINDEVOORT, "k1"))  # deze aanvraag mag de sleutel gebruiken
+    assert (bron._caches[ISS].sleutels, bron._caches[ISS].geldig_tot) == ({}, 0.0)
+    klok.nu = 1004.5
+    with pytest.raises(BronFout) as info:
+        _loop(bron.sleutel(LINDEVOORT, "k1"))
+    assert info.value.reden == "jwks_niet_beschikbaar"
+
+
+def test_jwks_uri_geldt_tot_de_kortste_van_metadata_en_jwks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleutel = Sleutelpaar.nieuw("k1")
+    _Klok(monkeypatch, 1000)
+
+    def antwoord(request: httpx2.Request) -> httpx2.Response:
+        if request.url.path.endswith("jwt-vc-issuer"):
+            return httpx2.Response(
+                200,
+                json={"issuer": ISS, "jwks_uri": f"{ISS}/jwks.json"},
+                headers={"cache-control": "max-age=5"},
+            )
+        return httpx2.Response(
+            200, json={"keys": [sleutel.jwks_lid]}, headers={"cache-control": "max-age=1000"}
+        )
+
+    bron = Sleutelbron(_jwks_ophaler(antwoord, {}))
+    _loop(bron.sleutel(LINDEVOORT, "k1"))
+    assert bron._caches[ISS].geldig_tot == 1005

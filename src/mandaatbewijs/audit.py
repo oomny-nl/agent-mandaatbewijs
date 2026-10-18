@@ -7,19 +7,29 @@ log in WORM-opslag.
 
 Events uit een transactionele outbox (de uitgever) dragen hun outboxnummer in `uitgaand`. Het log
 schrijft elk nummer hooguit één keer, ook als een eerdere poging na het schrijven maar vóór het
-opruimen van de outbox afbrak.
+opruimen van de outbox afbrak. Zo'n event draagt zijn eigen `tijd` (het moment van de mutatie);
+`geschreven` is het moment waarop het in het log kwam.
+
+Een append telt pas als de regel volledig en met `fsync` op schijf staat. Mislukt hij halverwege
+(vol volume, I/O-fout), dan zet het log het bestand terug op de lengte van vóór de poging. Een
+onvolledige laatste regel na een crash midden in een append is nooit bevestigd; het log verwijdert
+hem bij de start. De outbox schrijft zo'n event daarna opnieuw.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import os
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 GENESIS = "0" * 64
+
+log = logging.getLogger(__name__)
 
 
 def nu_iso() -> str:
@@ -43,11 +53,29 @@ class Auditlog:
         self._slot = threading.Lock()
         pad.parent.mkdir(parents=True, exist_ok=True)
         pad.touch()
-        records = lees(pad)
+        self._herlaad()
+
+    def _herlaad(self) -> None:
+        """Verwijder een onvolledige laatste regel en lees de kop van de keten uit het bestand."""
+        with self.pad.open("rb+") as f:
+            inhoud = f.read()
+            einde = inhoud.rfind(b"\n") + 1
+            if einde < len(inhoud):
+                log.warning(
+                    "auditlog %s: onvolledige laatste regel (%d bytes) verwijderd; "
+                    "die append is nooit bevestigd",
+                    self.pad,
+                    len(inhoud) - einde,
+                )
+                f.truncate(einde)
+            f.flush()
+            os.fsync(f.fileno())
+        records = lees(self.pad)
         laatste = records[-1:] or [{"nr": 0, "hash": GENESIS}]
         self._nr = int(laatste[0]["nr"])
         self._kop = str(laatste[0]["hash"])
         self._uitgaand = max((int(r.get("uitgaand", 0)) for r in records), default=0)
+        self._herstel_nodig = False
 
     def schrijf(self, **velden: Any) -> dict[str, Any]:
         """Voeg een record toe en geef het volledige record terug."""
@@ -60,13 +88,17 @@ class Auditlog:
         Outboxnummers stijgen (SQLite `AUTOINCREMENT`) en worden in volgorde geschreven.
         """
         with self._slot:
+            if self._herstel_nodig:
+                self._herlaad()
             if nr <= self._uitgaand:
                 return None
-            record = self._voeg_toe({**velden, "uitgaand": nr})
+            record = self._voeg_toe({**velden, "geschreven": nu_iso(), "uitgaand": nr})
             self._uitgaand = nr
             return record
 
     def _voeg_toe(self, velden: dict[str, Any]) -> dict[str, Any]:
+        if self._herstel_nodig:
+            self._herlaad()
         record: dict[str, Any] = {
             "nr": self._nr + 1,
             "tijd": nu_iso(),
@@ -75,10 +107,31 @@ class Auditlog:
             "vorige": self._kop,
         }
         record["hash"] = ketenhash(self._kop, record)
-        with self.pad.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        regel = (json.dumps(record, ensure_ascii=False) + "\n").encode()
+        with self.pad.open("ab") as f:
+            begin = f.tell()
+            try:
+                f.write(regel)
+                f.flush()
+                os.fsync(f.fileno())
+            except BaseException as fout:
+                self._zet_terug(f, begin, fout)
+                raise
         self._nr, self._kop = record["nr"], record["hash"]
         return record
+
+    def _zet_terug(self, f: Any, begin: int, fout: BaseException) -> None:
+        """Zet het bestand terug op `begin` na een mislukte append.
+
+        Lukt ook dat niet, dan leest de volgende append de kop eerst opnieuw uit het bestand.
+        """
+        try:
+            f.truncate(begin)
+            f.flush()
+            os.fsync(f.fileno())
+        except OSError as tweede:
+            self._herstel_nodig = True
+            fout.add_note(f"terugzetten van het auditlog mislukte ook: {tweede}")
 
 
 def lees(pad: Path) -> list[dict[str, Any]]:

@@ -144,8 +144,8 @@ weigering komt in het auditrecord:
    en draagt een nonce die dit register heeft uitgegeven. De nonce wordt op dat moment verbruikt,
    in één databasetransactie, ook bij gelijktijdige verzoeken.
 6. De statuslijst van de gemeente zegt dat het mandaat geldig is. Het register gebruikt een
-   gecachete lijst hoogstens `ttl` seconden na het begin van haar download en nooit na `exp` van
-   het token. Een achtergrondtaak ververst de lijsten (in Compose elke 5 seconden), zodat een
+   gecachete lijst hoogstens `ttl` seconden na het begin van haar download, min de `Age` van een
+   tussenliggende HTTP-cache, en nooit na `exp` van het token. Een achtergrondtaak ververst de lijsten (in Compose elke 5 seconden), zodat een
    presentatie meestal geen ophaalactie veroorzaakt. Is de gemeente onbereikbaar, dan overbrugt een
    geldige cache tot `exp` van het Status List Token; daarna geldt nee. Een ontvangen maar ongeldig
    token maakt de cache onbruikbaar.
@@ -174,7 +174,9 @@ Beide organisaties schrijven een hashketen. De gemeente logt verzoeken, toestemm
 uitgifte) of weigering, ophalen, intrekking en noodstop, plus geweigerde logins, ophalingen en
 beheerhandelingen. Elke toestandsovergang en haar auditevent gaan in één databasetransactie
 (transactionele outbox): een uitgifte of intrekking zonder auditevent bestaat niet. Het register
-logt elke toelating en elke weigering. De demo sorteert beide logs op tijd, controleert de ketens
+logt elke toelating en elke weigering. Een record telt pas mee als de volledige regel met `fsync`
+op schijf staat; een half geschreven regel (vol volume, crash) wordt teruggezet of bij de start
+verwijderd, zodat de keten heel blijft. De demo sorteert beide logs op tijd, controleert de ketens
 en eist per scenario de verwachte records, met het mandaat-id waar dat vaststaat.
 
 ## Bewijs
@@ -192,6 +194,7 @@ Elke bewering hierboven heeft een test die faalt als de maatregel wegvalt. Een s
 | Extra of weggelaten disclosure na het tekenen | geweigerd | `sd_hash` klopt niet | `test_disclosure_toegevoegd_na_tekenen_breekt_sd_hash` (u) |
 | Disclosure die `cnf` of `status` selectief maakt | geweigerd | beschermde claim | `test_selectieve_subclaim_in_beschermde_claim_wordt_geweigerd` (u) |
 | Mandaat ingetrokken | geweigerd voor elke aanroep vanaf `ttl` na de intrekking | statuslijst | `test_ingetrokken_geen_toegang_meer_na_ttl` (i) |
+| Mandaat ingetrokken, HTTP-cache tussen register en gemeente | geweigerd vanaf `ttl` na de intrekking | de `Age` van het antwoord telt mee | `test_tussenliggende_http_cache_verlengt_het_intrekkingsvenster_niet` (u) |
 | Gemeente onbereikbaar, cache geldig | toegestaan uit cache tot `exp` | overbrugging | `test_statuscache_overbrugt_netwerkfout_maar_niet_ongeldig_token` (u) |
 | Gemeente onbereikbaar, geen cache | geweigerd | status onbekend | `test_geen_cache_en_onbereikbaar_is_status_onbekend` (u) |
 | Mandaat van gemeente Elsweerd | geweigerd zonder netwerkverkeer | uitgever niet vertrouwd | `test_uitgever_niet_vertrouwd_zonder_netwerk` (u) |
@@ -199,6 +202,7 @@ Elke bewering hierboven heeft een test die faalt als de maatregel wegvalt. Een s
 | Agentsleutel geblokkeerd | mandaat ingetrokken, nieuw verzoek geweigerd | noodstop | `test_noodstop_blokkeert_sleutel` (i) |
 | Bram (intake) mandateert inkomen lezen | uitgifte geweigerd | bevoegdheid ontbreekt | `test_bevoegdheid_van_de_medewerker_begrenst_het_mandaat` (u) |
 | Auditrecord gewijzigd of weggelaten | keten breekt | hashketen | `test_gewijzigd_record_breekt_de_keten` (u) |
+| Auditregel half geschreven (vol volume, crash) | regel teruggezet, keten intact | `fsync` voordat de keten verder telt | `test_half_geschreven_regel_wordt_teruggezet` (u) |
 | Auditlog ontbreekt, is leeg of mist een verwacht record | demo faalt | bewijs onvolledig | `test_controleer_log_eist_bestaand_gevuld_en_volledig_log` (u) |
 | MCP-protocolfout of toolfout bij het register | agent meldt een fout, geen weigering | eigen soort | `test_toolknoop_onderscheidt_weigering_protocolfout_en_toolfout` (u) |
 
@@ -255,7 +259,7 @@ de EUDI-wallet en de NL GOV-profielen in [docs/ONTWERP.md](docs/ONTWERP.md).
 | `src/mandaatbewijs/houder/` | De agent: sleutelpaar, credential, presentatie per aanroep, MCP-verbinding, planner, LangGraph |
 | `src/mandaatbewijs/verifier/` | Inkomensregister: MCP-tools achter een poort, vertrouwenslijst, JWKS- en statuscache, nonces, audit |
 | `src/mandaatbewijs/demo.py` | Regie van de zes scenario's en de bewijstabel |
-| `tests/` | 263 unittests, 14 integratietests tegen de echte keten |
+| `tests/` | 287 unittests, 14 integratietests tegen de echte keten |
 | `docs/` | Ontwerp en dreigingsmodel |
 
 Kwaliteit: `ruff`, `ty`, `pytest`, de compose-keten en gitleaks in CI. Versies zijn exact gepind:

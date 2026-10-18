@@ -13,8 +13,8 @@ import asyncio
 import json
 import os
 import time
-from contextlib import AsyncExitStack
-from dataclasses import dataclass
+from contextlib import AsyncExitStack, ExitStack
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -230,19 +230,26 @@ def toon_toestemming(scherm: dict[str, Any]) -> None:
 
 @dataclass
 class Regie:
-    """Gedeelde onderdelen van de demo."""
+    """Gedeelde onderdelen van de demo; `with Regie(...)` sluit de portemonnees die hij maakt."""
 
     uitgever: str
     verifier: str
     wachtwoorden: dict[str, str]
+    portemonnees: ExitStack = field(default_factory=ExitStack)
+
+    def __enter__(self) -> Regie:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.portemonnees.close()
 
     def portaal(self, naam: str = "sanne") -> Portaal:
         """Portaal van een medewerker."""
         return Portaal(self.uitgever, naam, self.wachtwoorden[naam])
 
     def agent(self, kid: str = "assistent-1") -> Portemonnee:
-        """Nieuwe agent met eigen sleutelpaar."""
-        return Portemonnee(Sleutelpaar.nieuw(kid), self.uitgever)
+        """Nieuwe agent met eigen sleutelpaar; de HTTP-client sluit met de Regie."""
+        return self.portemonnees.enter_context(Portemonnee(Sleutelpaar.nieuw(kid), self.uitgever))
 
     def verleen(
         self, agent: Portemonnee, dossiers: list[str], naam: str = "sanne", doel: str | None = None
@@ -398,12 +405,12 @@ async def scenario_replay(regie: Regie, agent: Portemonnee) -> None:
         "haalt een verse nonce en tekent de key binding met een eigen sleutel",
         "yellow",
     )
-    dief = Portemonnee(Sleutelpaar.nieuw("dief"), regie.uitgever, agent.credential)
     async with httpx2.AsyncClient(timeout=10) as http:
         nonce = (await http.post(f"{regie.verifier}/nonces")).json()["nonce"]
-    gestolen = dief.presentatie(
-        regie.verifier, nonce, dief.disclosures_voor("inkomen:lezen", "2026-0142", True)
-    )
+    with Portemonnee(Sleutelpaar.nieuw("dief"), regie.uitgever, agent.credential) as dief:
+        gestolen = dief.presentatie(
+            regie.verifier, nonce, dief.disclosures_voor("inkomen:lezen", "2026-0142", True)
+        )
     status, reden = await _rauwe_aanroep(regie, gestolen, "2026-0142")
     zeg("register", f"WEIGERT: HTTP {status} {reden}", "bold red")
     GEBEURTENISSEN.append({"soort": "gestolen", "status": status, "reden": reden})
@@ -695,13 +702,13 @@ async def hoofd() -> None:
             expand=False,
         )
     )
-    regie = Regie(uitgever, verifier, wachtwoorden)
-    agent = await scenario_toegestaan(regie)
-    await scenario_buiten_mandaat(regie)
-    await scenario_replay(regie, agent)
-    await scenario_ingetrokken(regie)
-    await scenario_niet_vertrouwd(regie)
-    await scenario_noodstop(regie)
+    with Regie(uitgever, verifier, wachtwoorden) as regie:
+        agent = await scenario_toegestaan(regie)
+        await scenario_buiten_mandaat(regie)
+        await scenario_replay(regie, agent)
+        await scenario_ingetrokken(regie)
+        await scenario_niet_vertrouwd(regie)
+        await scenario_noodstop(regie)
     bewijstabel(
         {"uitgever": data_uitgever / "audit.jsonl", "register": data_verifier / "audit.jsonl"}
     )

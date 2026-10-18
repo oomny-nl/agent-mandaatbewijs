@@ -305,7 +305,11 @@ De verifier heeft drie bronnen, alle publiek en gecachet:
   `key_ops` niet bij ES256-verificatie past, maakt de JWKS ongeldig (RFC 7517 §4.2 tot en met
   4.4). Cache 300 seconden, of korter volgens `Cache-Control` en `Age` (RFC 9111: richtlijnen zijn
   hoofdletterongevoelig, `max-age` mag gequote zijn, en `no-store` en `no-cache` geven nul omdat
-  deze cache niet hervalideert), ook voor een `jwks` die inline in de metadata staat. Bij nul geldt
+  deze cache niet hervalideert), ook voor een `jwks` die inline in de metadata staat. De grens is
+  het begin van de ophaalactie plus die duur min `Age` (RFC 9111 §4.2.3: zo tellen de tijd in een
+  tussenliggende HTTP-cache en de transporttijd mee, zonder op de klok van de uitgever te leunen);
+  een ongeldige of dubbele `Age` geeft nul. Bij `jwks_uri` geldt de kortste grens van metadata en
+  JWKS. Bij nul, of als de grens bij aankomst al voorbij is, geldt
   de opgehaalde JWKS alleen voor de aanvraag die haar ophaalde en wordt niets bewaard. Metadata met zowel `jwks` als `jwks_uri` is onjuist. Alleen een sleutel
   uit een nog geldige cache of uit een zojuist geslaagde ophaalactie is bruikbaar. De verifier
   haalt per uitgever hoogstens eens per 10 seconden op, ook als de cache leeg of verlopen is, en
@@ -408,9 +412,13 @@ demo `ttl` op 5 seconden en `exp` op `iat + 60`; de instellingen `STATUSLIJST_TT
   na afloop van de vorige ronde, los van het presentatiemoment (ARF VCR_15); een presentatie
   veroorzaakt alleen een ophaalactie als er geen bruikbare cache is;
 - gebruikt een gecachete lijst alleen als **beide** gelden: `opgehaald + ttl > nu` **en**
-  `nu < exp` van het gecachete token, met `opgehaald` het begin van de download (een trage
-  download verlengt de cache niet). Een token dat op seconde 59 is opgehaald met `exp = 60` en
-  `ttl = 5` is op seconde 62 dus onbruikbaar, ook al is de `ttl` niet om;
+  `nu < exp` van het gecachete token, met `opgehaald` het begin van de download min de `Age` van
+  het antwoord (RFC 9111 §4.2.3; een trage download of een tussenliggende HTTP-cache verlengt de
+  cache dus niet). Een token dat op seconde 59 is opgehaald met `exp = 60` en `ttl = 5` is op
+  seconde 62 dus onbruikbaar, ook al is de `ttl` niet om. Een ongeldige of dubbele `Age` telt als
+  oneindig oud. Een token dat bij aankomst al ouder is dan `ttl`, wordt wel bewaard (het kan een
+  intrekking bevatten), maar telt als mislukte verversing: hoogstens overbrugging tot `exp`, nooit
+  `vers`. Hetzelfde token opnieuw met meer `Age` verkort de cache niet;
 - haalt anders een nieuwe op. Lukt dat **niet** door een netwerk- of HTTP-fout (geen antwoord,
   time-out, status ≠ 200, verkeerd mediatype), dan geldt: is het gecachete token nog niet voorbij
   zijn eigen `exp`, dan wordt het gebruikt en krijgt het auditrecord `status_bron:
@@ -440,7 +448,11 @@ demo `ttl` op 5 seconden en `exp` op `iat + 60`; de instellingen `STATUSLIJST_TT
 Gevolg voor intrekking (intrekking om T): zolang de verifier de uitgever kan bereiken, wordt elke
 aanroep die om T + `ttl` of later begint, geweigerd. Een cache die vóór T is opgehaald, is dan
 verlopen, en een download die na T begint, krijgt een token met de nieuwe bit, want na een
-intrekking tekent de uitgever altijd opnieuw. Een aanroep die eerder begint, kan nog worden
+intrekking tekent de uitgever altijd opnieuw. Dat geldt ook met een HTTP-cache tussen verifier en
+uitgever die zich aan RFC 9111 houdt en bij een opgeslagen antwoord `Age` meestuurt: de verifier
+telt die ouderdom mee. Een cache die een opgeslagen antwoord zonder `Age` levert (in strijd met
+RFC 9111 §4), kan het venster met zijn eigen bewaartijd verlengen, bij `max-age=ttl` tot
+T + 2 × `ttl` en nooit voorbij `exp`; dat valt buiten deze garantie. Een aanroep die eerder begint, kan nog worden
 toegelaten; de achtergrondverversing maakt dat venster in de praktijk korter, maar de grens volgt
 uit de cacheregel en niet uit die klok. Antwoordt de uitgever niet of met een fout, dan schuift de
 grens op tot de `exp` van het gecachete token (in de demo `iat` + 60). Een aanroep die al is
@@ -505,8 +517,14 @@ draagt de hash van het vorige), in een eigen Docker-volume. De uitgever logt ver
 weigering van toestemming, uitgifte, ophalen, intrekking en noodstop, plus geweigerde logins,
 ophalingen en beheerhandelingen. Elke toestandsovergang schrijft haar auditevent in dezelfde
 SQLite-transactie naar een outbox (`audit_uitgaand`); de dienst zet de outbox daarna in volgorde in
-de hashketen, ook na een herstart, zonder dubbele records. Een uitgifte of intrekking zonder
-auditevent bestaat dus niet. De verifier logt elke `tools/call` met beslissing en reden, en ook een
+de hashketen, ook na een herstart, zonder dubbele records. Een outboxevent houdt de tijd van de
+overgang (`tijd`) en krijgt bij het afleveren `geschreven` erbij. Een uitgifte of intrekking zonder
+auditevent bestaat dus niet. Een record telt pas mee als de volledige regel met `fsync` op schijf
+staat. Mislukt het schrijven halverwege (vol volume, I/O-fout), dan kapt het log het bestand terug
+tot vóór die regel; mislukt ook dat, dan herstelt de volgende schrijfactie het eerst. Een
+onvolledige laatste regel na een crash wordt bij de start verwijderd en als waarschuwing gelogd.
+Een half geschreven record breekt de keten dus niet, en bij de uitgever blijft het event in de
+outbox tot het volledig in het log staat. De verifier logt elke `tools/call` met beslissing en reden, en ook een
 te groot verzoek, een misvormde header en een niet toegestane methode; nonce-uitgifte logt hij niet
 (ruis). De demo leest beide logs (alleen-lezen volumes), eist dat ze bestaan en niet leeg zijn,
 controleert beide ketens, zoekt per scenario de verwachte records (gebeurtenis, reden en waar dat

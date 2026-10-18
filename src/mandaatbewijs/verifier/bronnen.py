@@ -4,11 +4,18 @@ Ophalen (ONTWERP §7): dezelfde oorsprong als `iss`, `https` tenzij `STA_HTTP_TO
 vóór de verbinding, geen redirects, hoogstens 64 KiB (na eventuele decompressie) en 5 seconden
 voor naamresolutie en download samen.
 
+Ouderdom (RFC 9111 §4.2.3): een antwoord is zo oud als zijn `Age`-header plus de tijd sinds het
+begin van de aanvraag. `Date` telt niet mee: dat zou de klok van de uitgever met die van de
+verifier vergelijken; RFC 9111 staat toe alleen `Age` te gebruiken, en een HTTP-cache die een
+opgeslagen antwoord levert, moet `Age` sturen (§4).
+
 Statuscache (ONTWERP §7), per combinatie van uitgever en lijst-URI: bruikbaar zolang
-`opgehaald + ttl > nu` én `nu < exp`, met `opgehaald` het begin van de download; bij een
-netwerkfout overbrugging tot `exp`; een ontvangen maar ongeldig token, of elke onverwachte fout bij
-het verwerken ervan, maakt de cache onbruikbaar tot een geldige verversing. Gelijktijdige
-verversingen van dezelfde lijst worden geserialiseerd en delen de uitkomst, geslaagd of mislukt.
+`opgehaald + ttl > nu` én `nu < exp`, met `opgehaald` het begin van de download min `Age`. Een
+geldig token dat bij aankomst al ouder is dan `ttl` (of met een ongeldige `Age`) wordt bewaard
+maar telt als netwerkfout, nooit als vers. Bij een netwerkfout overbrugging tot `exp`; een
+ontvangen maar ongeldig token, of elke onverwachte fout bij het verwerken ervan, maakt de cache
+onbruikbaar tot een geldige verversing. Gelijktijdige verversingen van dezelfde lijst worden
+geserialiseerd en delen de uitkomst, geslaagd of mislukt.
 Het token met de hoogste `iat` blijft bewaard, ook als de cache onbruikbaar is: een ouder token
 vervangt het nooit en bevestigt het ook niet (het telt als mislukte verversing), en een ander
 token met dezelfde `iat` maar een andere lijst maakt de cache onbruikbaar. Een achtergrondtaak
@@ -19,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import math
 import re
 import socket
 import time
@@ -170,12 +178,14 @@ class Ophaler:
 
 
 def _cacheduur(antwoord: httpx2.Response, standaard: int) -> int:
-    """Hoe lang een antwoord bewaard mag worden, in seconden (RFC 9111); 0 is niet bewaren.
+    """Resterende versheid in seconden, geteld vanaf het begin van de aanvraag; 0 is niet bewaren.
 
-    Richtlijnen zijn hoofdletterongevoelig en mogen een gequote waarde hebben (`max-age="5"`).
-    `no-store` en `no-cache` geven 0: deze cache hervalideert niet, dus elke keer opnieuw ophalen.
-    Een ongeldige of dubbele `max-age` of een ongeldige `Age` geeft ook 0 (RFC 9111 §4.2.1: dan
-    als verouderd behandelen). Een geldige `Age` gaat van `max-age` af; hoogstens `standaard`.
+    Levensduur is `max-age`, zonder `max-age` de lokale `standaard`, en hoogstens `standaard`
+    (RFC 9111 §4.2.1). Daar gaat de `Age` af (§4.2.3): wie de grens op begin van de aanvraag plus
+    deze duur zet, rekent ook de transporttijd als ouderdom. Richtlijnen zijn hoofdletterongevoelig
+    en mogen een gequote waarde hebben (`max-age="5"`). `no-store` en `no-cache` geven 0: deze
+    cache hervalideert niet, dus elke keer opnieuw ophalen. Een ongeldige of dubbele `max-age` of
+    een ongeldige `Age` geeft ook 0 (§4.2.1: dan als verouderd behandelen).
     """
     richtlijnen: dict[str, list[str]] = {}
     for deel in antwoord.headers.get_list("cache-control", split_commas=True):
@@ -188,12 +198,18 @@ def _cacheduur(antwoord: httpx2.Response, standaard: int) -> int:
         return 0
     max_age = richtlijnen.get("max-age")
     if max_age is None:
-        return standaard
-    duur = _delta_seconden(max_age[0]) if len(max_age) == 1 else None
-    leeftijd = _delta_seconden(antwoord.headers.get("age", "0").strip())
+        duur: int | None = standaard
+    else:
+        duur = _delta_seconden(max_age[0]) if len(max_age) == 1 else None
+    leeftijd = _leeftijd(antwoord)
     if duur is None or leeftijd is None:
         return 0
-    return max(0, min(standaard, duur - leeftijd))
+    return max(0, min(standaard, duur) - leeftijd)
+
+
+def _leeftijd(antwoord: httpx2.Response) -> int | None:
+    """De `Age`-header in seconden (0 zonder header); None als ongeldig of meer dan eens gezet."""
+    return _delta_seconden(antwoord.headers.get("age", "0").strip())
 
 
 def _delta_seconden(waarde: str) -> int | None:
@@ -253,24 +269,33 @@ class Sleutelbron:
             return sleutels[kid]
 
     async def _ververs(self, uitgever: Uitgever, cache: JwksCache) -> dict[str, ECKey]:
-        """Haal de sleutels op; bewaar ze alleen als het antwoord caching toestaat."""
+        """Haal de sleutels op; bewaar ze alleen zolang beide antwoorden vers zijn.
+
+        Elke grens telt vanaf het begin van de aanvraag (zie `_cacheduur`). Bij `jwks_uri` geldt
+        de kortste van metadata en JWKS: de metadata bepaalt welke `jwks_uri` geldt.
+        """
         meta_url = metadata_url(uitgever.iss)
+        begin = time.time()
         antwoord = await self.ophaler.haal(meta_url, uitgever.iss, "application/json")
+        geldig_tot = begin + _cacheduur(antwoord, JWKS_CACHE_S)
         meta = _json(antwoord, "uitgever_metadata_onjuist")
         if not isinstance(meta, dict) or meta.get("issuer") != uitgever.iss:
             raise BronFout("uitgever_metadata_onjuist", "ongeldig", f"issuer ≠ {uitgever.iss}")
         if "jwks" in meta and "jwks_uri" in meta:
             raise BronFout("uitgever_metadata_onjuist", "ongeldig", "jwks én jwks_uri aanwezig")
         if "jwks" in meta:
-            jwks, duur = meta["jwks"], _cacheduur(antwoord, JWKS_CACHE_S)
+            jwks = meta["jwks"]
         else:
             jwks_uri = str(meta.get("jwks_uri", ""))
+            begin = time.time()
             antwoord = await self.ophaler.haal(jwks_uri, uitgever.iss, "application/json")
-            jwks, duur = _json(antwoord, "jwks_ongeldig"), _cacheduur(antwoord, JWKS_CACHE_S)
+            geldig_tot = min(geldig_tot, begin + _cacheduur(antwoord, JWKS_CACHE_S))
+            jwks = _json(antwoord, "jwks_ongeldig")
         sleutels = _lees_jwks(jwks)
-        # `no-store` of `max-age=0`: alleen voor deze aanvraag, niet voor volgende.
-        cache.sleutels = sleutels if duur else {}
-        cache.geldig_tot = time.time() + duur if duur else 0.0
+        # `no-store`, `max-age=0` of al verlopen bij aankomst: alleen voor deze aanvraag.
+        bewaren = geldig_tot > time.time()
+        cache.sleutels = sleutels if bewaren else {}
+        cache.geldig_tot = geldig_tot if bewaren else 0.0
         return sleutels
 
 
@@ -359,7 +384,15 @@ class Statusbron:
                 cache.afgerond += 1
 
     async def _haal_en_lees(self, cache: Statuscache, uri: str, uitgever: Uitgever) -> None:
-        begin = time.time()  # de inhoud is minstens zo vers als het begin van de download
+        """Download, controleer en bewaar het token; weiger een te oud antwoord als `vers`.
+
+        De inhoud is minstens zo vers als het begin van de download min de `Age` die een
+        tussenliggende HTTP-cache meestuurt. Is het token geldig en het nieuwste, maar bij
+        aankomst al ouder dan `ttl` (of is de `Age` ongeldig), dan blijft het bewaard: het kan een
+        intrekking bevatten die de oude cache mist. De verversing telt dan als netwerkfout, zodat
+        `status()` hoogstens overbrugt tot `exp` en het nooit als vers meldt.
+        """
+        begin = time.time()
         try:
             antwoord = await self.ophaler.haal(uri, uitgever.iss, MEDIATYPE)
             mediatype = antwoord.headers.get("content-type", "")
@@ -377,7 +410,15 @@ class Statusbron:
             raise BronFout(
                 "statusverwerking_mislukt", "ongeldig", f"{type(fout).__name__}: {fout}"
             ) from fout
-        cache.token, cache.opgehaald, cache.onbruikbaar = token, begin, False
+        leeftijd = _leeftijd(antwoord)
+        opgehaald = begin - leeftijd if leeftijd is not None else -math.inf
+        if cache.token is not None and token.iat == cache.token.iat:
+            # Hetzelfde token (anders weigerde `_vergelijk_met_cache`): een eerder, verser
+            # antwoord blijft bewijs dat deze inhoud toen actueel was.
+            opgehaald = max(opgehaald, cache.opgehaald)
+        cache.token, cache.opgehaald, cache.onbruikbaar = token, opgehaald, False
+        if not self._bruikbaar(cache, time.time()):
+            raise BronFout("statusantwoord_verouderd", "netwerk", f"{uri}: Age {leeftijd}")
 
     @staticmethod
     def _vergelijk_met_cache(cache: Statuscache, token: Statustoken) -> None:

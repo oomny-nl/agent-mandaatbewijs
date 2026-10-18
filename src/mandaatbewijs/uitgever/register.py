@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from mandaatbewijs.audit import nu_iso
 from mandaatbewijs.statuslijst import GELDIG, INGETROKKEN, Statuslijst
 
 POSITIES = 1 << 16
@@ -178,10 +179,10 @@ class Register:
 
     @staticmethod
     def _leg_vast(db: sqlite3.Connection, **velden: Any) -> None:
-        """Zet een auditevent in de outbox, binnen de lopende transactie."""
+        """Zet een auditevent in de outbox, binnen de lopende transactie, met de tijd van nu."""
         db.execute(
             "INSERT INTO audit_uitgaand (velden) VALUES (?)",
-            (json.dumps(velden, ensure_ascii=False),),
+            (json.dumps({"tijd": nu_iso(), **velden}, ensure_ascii=False),),
         )
 
     def uitgaand(self) -> list[tuple[int, dict[str, Any]]]:

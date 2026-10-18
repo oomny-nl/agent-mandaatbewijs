@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
+import pytest
+
+from mandaatbewijs import audit
 from mandaatbewijs.audit import GENESIS, Auditlog, controleer, ketenhash, lees
+from tests.unit.conftest import VolVolume
 
 
 def test_keten_is_intact_en_hervat_na_herstart(tmp_path: Path) -> None:
@@ -65,3 +70,92 @@ def test_ketenhash_is_deterministisch_en_negeert_hash_veld() -> None:
     assert h == ketenhash(GENESIS, {**record, "hash": "x"})
     assert h == ketenhash(GENESIS, json.loads(json.dumps(record)))
     assert h != ketenhash("1" * 64, record)
+
+
+def test_half_geschreven_regel_wordt_teruggezet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pad = tmp_path / "audit.jsonl"
+    log = Auditlog(pad, "lindevoort")
+    log.schrijf_uitgaand(1, {"gebeurtenis": "verzoek"})
+    voor = pad.read_bytes()
+    grens = VolVolume(monkeypatch, pad, deel=20)
+    with pytest.raises(OSError, match="No space"):
+        log.schrijf_uitgaand(2, {"gebeurtenis": "uitgegeven"})
+    assert pad.read_bytes() == voor  # de halve regel is weg
+    grens.actief = False
+    assert log.schrijf_uitgaand(2, {"gebeurtenis": "uitgegeven"}) is not None
+    assert log.schrijf_uitgaand(2, {"gebeurtenis": "uitgegeven"}) is None  # één keer
+    records = lees(pad)
+    assert [(r["nr"], r["uitgaand"]) for r in records] == [(1, 1), (2, 2)]
+    assert controleer(records) == (True, "intact")
+    Auditlog(pad, "lindevoort")  # herstart leest het bestand zonder fout
+
+
+def test_fout_bij_fsync_na_volledige_regel_geeft_geen_dubbel_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """De regel staat er helemaal, maar `fsync` faalt: niet bevestigd, dus terugzetten."""
+    pad = tmp_path / "audit.jsonl"
+    log = Auditlog(pad, "lindevoort")
+    log.schrijf_uitgaand(1, {"gebeurtenis": "verzoek"})
+    echt, pogingen = audit.os.fsync, []
+
+    def fsync(fd: int) -> None:
+        pogingen.append(fd)
+        if len(pogingen) == 1:
+            raise OSError(5, "Input/output error")
+        echt(fd)
+
+    monkeypatch.setattr(audit.os, "fsync", fsync)
+    with pytest.raises(OSError, match="Input/output"):
+        log.schrijf_uitgaand(2, {"gebeurtenis": "uitgegeven"})
+    assert len(lees(pad)) == 1
+    log.schrijf_uitgaand(2, {"gebeurtenis": "uitgegeven"})
+    records = lees(pad)
+    assert [r["uitgaand"] for r in records] == [1, 2]
+    assert controleer(records) == (True, "intact")
+
+
+def test_onvolledige_laatste_regel_wordt_bij_de_start_verwijderd(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Een crash midden in een append laat een regel zonder einde achter; nooit bevestigd."""
+    pad = tmp_path / "audit.jsonl"
+    Auditlog(pad, "lindevoort").schrijf_uitgaand(1, {"gebeurtenis": "verzoek"})
+    with pad.open("ab") as f:
+        f.write(b'{"nr": 2, "tijd": "2026-')
+    with caplog.at_level(logging.WARNING, logger="mandaatbewijs.audit"):
+        log = Auditlog(pad, "lindevoort")
+    assert "onvolledige laatste regel (24 bytes) verwijderd" in caplog.text
+    log.schrijf_uitgaand(2, {"gebeurtenis": "uitgegeven"})
+    records = lees(pad)
+    assert [r["nr"] for r in records] == [1, 2]
+    assert controleer(records) == (True, "intact")
+
+
+def test_mislukt_terugzetten_herstelt_bij_de_volgende_append(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pad = tmp_path / "audit.jsonl"
+    log = Auditlog(pad, "lindevoort")
+    log.schrijf_uitgaand(1, {"gebeurtenis": "verzoek"})
+    grens = VolVolume(monkeypatch, pad, deel=20, truncate_faalt=True)
+    with pytest.raises(OSError, match="No space") as info:
+        log.schrijf_uitgaand(2, {"gebeurtenis": "uitgegeven"})
+    assert "terugzetten van het auditlog mislukte ook" in str(info.value.__notes__)
+    assert not pad.read_bytes().endswith(b"\n")  # de halve regel staat er nog
+    grens.actief = False
+    log.schrijf_uitgaand(2, {"gebeurtenis": "uitgegeven"})
+    records = lees(pad)
+    assert [(r["nr"], r["uitgaand"]) for r in records] == [(1, 1), (2, 2)]
+    assert controleer(records) == (True, "intact")
+
+
+def test_outboxevent_houdt_zijn_eigen_tijd(tmp_path: Path) -> None:
+    pad = tmp_path / "audit.jsonl"
+    log = Auditlog(pad, "lindevoort")
+    record = log.schrijf_uitgaand(1, {"tijd": "2026-01-01T00:00:00.000+00:00", "gebeurtenis": "x"})
+    assert record is not None
+    assert record["tijd"] == "2026-01-01T00:00:00.000+00:00"
+    assert record["geschreven"] > record["tijd"]

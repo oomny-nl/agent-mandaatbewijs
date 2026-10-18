@@ -9,7 +9,8 @@ from __future__ import annotations
 import json
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -75,7 +76,14 @@ Verlener = Callable[..., Mandaat]
 
 
 @pytest.fixture
-def verleen(omgeving: Omgeving) -> Verlener:
+def portemonnees() -> Iterator[ExitStack]:
+    """Sluit na de test elke portemonnee die erin is gezet (`enter_context`)."""
+    with ExitStack() as stack:
+        yield stack
+
+
+@pytest.fixture
+def verleen(omgeving: Omgeving, portemonnees: ExitStack) -> Verlener:
     """Fabriek: agent vraagt, medewerker zegt ja, agent haalt op."""
 
     def maak(
@@ -84,7 +92,9 @@ def verleen(omgeving: Omgeving) -> Verlener:
         doel: str = "aanvraag-levensonderhoud",
         agent: Portemonnee | None = None,
     ) -> Mandaat:
-        agent = agent or Portemonnee(Sleutelpaar.nieuw("test-agent"), omgeving.uitgever)
+        agent = agent or portemonnees.enter_context(
+            Portemonnee(Sleutelpaar.nieuw("test-agent"), omgeving.uitgever)
+        )
         verzoek_id = agent.vraag_mandaat(naam, doel, ["inkomen:lezen"], dossiers or ["2026-0142"])
         antwoord = omgeving.portaal(naam).beslis(verzoek_id, "ja", 300)
         assert antwoord.status_code == 200, antwoord.text

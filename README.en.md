@@ -143,7 +143,8 @@ goes into the audit record:
    carries a nonce this register issued. The nonce is consumed at that moment, in one database
    transaction, also under concurrent requests.
 6. The municipality's status list says the mandate is valid. The register uses a cached list for
-   at most `ttl` seconds after the start of its download and never past the token's `exp`. A
+   at most `ttl` seconds after the start of its download, minus the `Age` of an intermediate HTTP
+   cache, and never past the token's `exp`. A
    background task refreshes the lists (every 5 seconds in Compose), so a presentation rarely
    triggers a fetch. If the municipality is unreachable, a valid cache bridges the gap until the
    Status List Token's `exp`; after that the answer is no. A received but invalid token makes the
@@ -172,9 +173,10 @@ Both organisations write a hash chain. The municipality logs requests, consent (
 issuance) or refusal, retrieval, revocation and emergency stop, plus refused logins, retrievals and
 administrative actions. Every state transition and its audit event are written in one database
 transaction (transactional outbox): an issuance or revocation without an audit event cannot exist.
-The register logs every allowed and refused call. The demo sorts both logs by time, verifies the
-chains and requires the expected records for each scenario, with the mandate id where it is
-established.
+The register logs every allowed and refused call. A record only counts once the complete line is on
+disk with `fsync`; a half-written line (full volume, crash) is rolled back or removed at startup, so
+the chain stays intact. The demo sorts both logs by time, verifies the chains and requires the
+expected records for each scenario, with the mandate id where it is established.
 
 ## Evidence
 
@@ -191,6 +193,7 @@ Every claim above has a test that fails when the measure is removed. A selection
 | Disclosure added or removed after signing | refused | `sd_hash` mismatch | `test_disclosure_toegevoegd_na_tekenen_breekt_sd_hash` (u) |
 | Disclosure that makes `cnf` or `status` selective | refused | protected claim | `test_selectieve_subclaim_in_beschermde_claim_wordt_geweigerd` (u) |
 | Mandate revoked | refused for every call from `ttl` after the revocation | status list | `test_ingetrokken_geen_toegang_meer_na_ttl` (i) |
+| Mandate revoked, HTTP cache between register and municipality | refused from `ttl` after the revocation | the response's `Age` counts | `test_tussenliggende_http_cache_verlengt_het_intrekkingsvenster_niet` (u) |
 | Municipality unreachable, cache valid | allowed from cache until `exp` | bridging | `test_statuscache_overbrugt_netwerkfout_maar_niet_ongeldig_token` (u) |
 | Municipality unreachable, no cache | refused | status unknown | `test_geen_cache_en_onbereikbaar_is_status_onbekend` (u) |
 | Mandate from the municipality of Elsweerd | refused without network traffic | issuer not trusted | `test_uitgever_niet_vertrouwd_zonder_netwerk` (u) |
@@ -198,6 +201,7 @@ Every claim above has a test that fails when the measure is removed. A selection
 | Agent key blocked | mandate revoked, new request refused | emergency stop | `test_noodstop_blokkeert_sleutel` (i) |
 | Bram (intake) mandates reading income | issuance refused | not authorised himself | `test_bevoegdheid_van_de_medewerker_begrenst_het_mandaat` (u) |
 | Audit record modified or omitted | chain breaks | hash chain | `test_gewijzigd_record_breekt_de_keten` (u) |
+| Audit line half written (full volume, crash) | line rolled back, chain intact | `fsync` before the chain moves on | `test_half_geschreven_regel_wordt_teruggezet` (u) |
 | Audit log missing, empty or lacking an expected record | demo fails | evidence incomplete | `test_controleer_log_eist_bestaand_gevuld_en_volledig_log` (u) |
 | MCP protocol error or tool error at the register | agent reports an error, not a refusal | separate kind | `test_toolknoop_onderscheidt_weigering_protocolfout_en_toolfout` (u) |
 
@@ -254,7 +258,7 @@ relation to the EUDI wallet and the Dutch NL GOV profiles are in [docs/ONTWERP.m
 | `src/mandaatbewijs/houder/` | The agent: key pair, credential, presentation per call, MCP connection, planner, LangGraph |
 | `src/mandaatbewijs/verifier/` | Income register: MCP tools behind a gateway, trust list, JWKS and status cache, nonces, audit |
 | `src/mandaatbewijs/demo.py` | Orchestration of the six scenarios and the evidence table |
-| `tests/` | 263 unit tests, 14 integration tests against the real chain |
+| `tests/` | 287 unit tests, 14 integration tests against the real chain |
 | `docs/` | Design and threat model (Dutch) |
 
 Quality: `ruff`, `ty`, `pytest`, the Compose chain and gitleaks in CI. Versions are pinned
