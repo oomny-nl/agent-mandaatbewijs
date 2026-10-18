@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import sqlite3
 import time
 from pathlib import Path
@@ -1072,12 +1073,14 @@ def test_gecomprimeerd_antwoord_valt_onder_de_grens_na_decompressie() -> None:
         ({"cache-control": 'no-cache="set-cookie"'}, 0),
         ({"cache-control": 'max-age="1"'}, 1),
         ({"cache-control": "MAX-AGE=7"}, 7),
-        ({"cache-control": "max-age=60", "age": "50"}, 10),
+        ({"cache-control": "max-age=60", "age": "0"}, 59),  # Age in hele seconden: plus 1
+        ({"cache-control": "max-age=60", "age": "49"}, 10),
+        ({"cache-control": "max-age=60", "age": "59"}, 0),
         ({"cache-control": "max-age=60", "age": "70"}, 0),
         ({"cache-control": "max-age=60", "age": "x"}, 0),
         ({"cache-control": "max-age=60", "age": "5, 6"}, 0),  # twee Age-headers
-        ({"cache-control": "max-age=999999", "age": "100"}, 200),
-        ({"age": "290"}, 10),  # zonder max-age telt de ouderdom ook
+        ({"cache-control": "max-age=999999", "age": "100"}, 199),
+        ({"age": "290"}, 9),  # zonder max-age telt de ouderdom ook
         ({"age": "400"}, 0),
         ({"age": "x"}, 0),
         ({"cache-control": "max-age=abc"}, 0),
@@ -1092,26 +1095,46 @@ def test_cacheduur_volgt_rfc_9111(headers: dict[str, Any], verwacht: int) -> Non
     assert bronnen._cacheduur(antwoord, bronnen.JWKS_CACHE_S) == verwacht
 
 
-def test_dubbele_age_header_is_ongeldig() -> None:
-    antwoord = httpx2.Response(200, headers=[("age", "5"), ("age", "6")])
-    assert bronnen._leeftijd(antwoord) is None
-    assert bronnen._cacheduur(antwoord, bronnen.JWKS_CACHE_S) == 0
-
-
-def test_tussenliggende_http_cache_verlengt_het_intrekkingsvenster_niet(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("headers", "verwacht"),
+    [
+        ([], 0),  # geen cache ertussen
+        ([("age", "0")], 1),  # afgerond naar beneden: tot een seconde oud
+        ([("age", "4")], 5),
+        ([("age", "x")], None),
+        ([("age", "-1")], None),
+        ([("age", "5"), ("age", "6")], None),  # eigen beleid, strenger dan RFC 9111 §5.1
+    ],
+)
+def test_leeftijd_telt_de_afrondingsseconde_mee(
+    headers: list[tuple[str, str]], verwacht: int | None
 ) -> None:
-    """Een gedeelde HTTP-cache (RFC 9111 §4) bewaarde de lijst op 999; intrekking op T = 1000.
+    antwoord = httpx2.Response(200, headers=headers)
+    assert bronnen._leeftijd(antwoord) == verwacht
+    if verwacht is None:
+        assert bronnen._cacheduur(antwoord, bronnen.JWKS_CACHE_S) == 0
 
-    De cache levert dat oude antwoord met `Age` mee. De ouderdom telt mee: het antwoord is
-    bruikbaar tot 999 + ttl (1004), daarna haalt de verifier opnieuw op en moet de cache zelf naar
-    de uitgever. Zonder `Age` zou de oude lijst tot 1008 gelden, ruim na T + ttl (1005).
+
+@pytest.mark.parametrize(
+    ("opgeslagen_op", "eerste"),
+    [(999.95, 1000.5), (999.95, 1002.9), (999.5, 1003.4), (999.05, 1001.0), (999.0, 1003.0)],
+)
+def test_tussenliggende_http_cache_verlengt_het_intrekkingsvenster_niet(
+    monkeypatch: pytest.MonkeyPatch, opgeslagen_op: float, eerste: float
+) -> None:
+    """Een gedeelde HTTP-cache (RFC 9111 §4) bewaarde de lijst vlak voor de intrekking op T = 1000.
+
+    De cache levert dat oude antwoord met `Age` in hele seconden, naar beneden afgerond zoals
+    Varnish, en haalt pas na `max-age` opnieuw op (geen grace). De verifier vraagt vanaf `eerste`
+    elke 0,05 s. Elke aanroep vanaf T + ttl (1005) moet de intrekking zien. Zonder `Age` gold de
+    oude lijst tot ruim na 1005; met `Age` zonder de afrondingsseconde bij (999.95, 1000.5) nog
+    tot 1005.5.
     """
     sleutel = Sleutelpaar.nieuw("u1")
-    klok = _Klok(monkeypatch, 1003)
-    uitgever = {"token": _statustoken(sleutel, 1, iat=1000, exp=1060)}  # na de intrekking
-    opgeslagen: dict[str, Any] = {
-        "tijd": 999.0,
+    klok = _Klok(monkeypatch, eerste)
+    na_intrekking = _statustoken(sleutel, 1, iat=1000, exp=1060)
+    cache: dict[str, Any] = {
+        "tijd": opgeslagen_op,
         "token": _statustoken(sleutel, 0, iat=999, exp=1059),
     }
 
@@ -1122,14 +1145,11 @@ def test_tussenliggende_http_cache_verlengt_het_intrekkingsvenster_niet(
                 json={"issuer": ISS, "jwks": {"keys": [sleutel.jwks_lid]}},
                 headers={"cache-control": "max-age=100000"},
             )
-        if klok.nu - opgeslagen["tijd"] >= 5:  # niet meer vers voor de cache: naar de uitgever
-            opgeslagen.update(tijd=klok.nu, token=uitgever["token"])
+        if klok.nu - cache["tijd"] >= 5:  # niet meer vers voor de cache: naar de uitgever
+            cache.update(tijd=klok.nu, token=na_intrekking)
         kop = {**STATUS_KOP, "cache-control": "max-age=5"}
-        return httpx2.Response(
-            200,
-            text=opgeslagen["token"],
-            headers={**kop, "age": str(int(klok.nu - opgeslagen["tijd"]))},
-        )
+        age = str(math.floor(klok.nu - cache["tijd"]))
+        return httpx2.Response(200, text=cache["token"], headers={**kop, "age": age})
 
     ophaler = Ophaler(
         True,
@@ -1137,14 +1157,13 @@ def test_tussenliggende_http_cache_verlengt_het_intrekkingsvenster_niet(
         httpx2.AsyncClient(transport=httpx2.MockTransport(http_cache)),
     )  # type: ignore[arg-type]
     bron = Statusbron(ophaler, Sleutelbron(ophaler))
-    # 1003: het oude antwoord (Age 4) is nog vers; vóór T + ttl mag dat.
-    assert _loop(bron.status(STATUS_URI, 3, LINDEVOORT)) == bronnen.Statusuitkomst(0, "vers")
-    assert bron._caches[(ISS, STATUS_URI)].opgehaald == 999
-    klok.nu = 1003.75
-    assert _loop(bron.status(STATUS_URI, 3, LINDEVOORT)) == bronnen.Statusuitkomst(0, "cache")
-    for kwart in range(25):  # 1004 tot en met 1010: steeds de intrekking
-        klok.nu = 1004 + kwart / 4
-        assert _loop(bron.status(STATUS_URI, 3, LINDEVOORT)).waarde == 1
+    uitkomsten: list[tuple[float, bronnen.Statusuitkomst]] = []
+    for tik in range(round(eerste * 20), 1012 * 20 + 1):
+        klok.nu = tik / 20
+        uitkomsten.append((klok.nu, _loop(bron.status(STATUS_URI, 3, LINDEVOORT))))
+    assert any(t == 1005 for t, _ in uitkomsten)  # ook een aanroep precies op T + ttl
+    assert [(t, u) for t, u in uitkomsten if t >= 1005 and u.waarde != 1] == []
+    assert any(u.waarde == 0 for _, u in uitkomsten)  # de oude lijst is echt geleverd
 
 
 def test_te_oud_antwoord_bewaart_de_intrekking_maar_telt_nooit_als_vers(
@@ -1208,11 +1227,11 @@ def _jwks_bron(klok: _Klok, kop: dict[str, str], duur: float = 0.0) -> Sleutelbr
 
 
 def test_jwks_grens_telt_age_en_transporttijd(monkeypatch: pytest.MonkeyPatch) -> None:
-    """RFC 9111 §4.2.3: de grens is begin van de aanvraag plus levensduur min `Age`."""
+    """RFC 9111 §4.2.3: begin van de aanvraag plus levensduur min `Age` en de afrondingsseconde."""
     klok = _Klok(monkeypatch, 1000)
     bron = _jwks_bron(klok, {"cache-control": "max-age=10", "age": "2"}, duur=3)
     _loop(bron.sleutel(LINDEVOORT, "k1"))
-    assert bron._caches[ISS].geldig_tot == 1008
+    assert bron._caches[ISS].geldig_tot == 1007
 
 
 def test_jwks_die_bij_aankomst_al_verlopen_is_wordt_niet_bewaard(

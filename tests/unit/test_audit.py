@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 
 import pytest
@@ -149,6 +150,51 @@ def test_mislukt_terugzetten_herstelt_bij_de_volgende_append(
     log.schrijf_uitgaand(2, {"gebeurtenis": "uitgegeven"})
     records = lees(pad)
     assert [(r["nr"], r["uitgaand"]) for r in records] == [(1, 1), (2, 2)]
+    assert controleer(records) == (True, "intact")
+
+
+def test_fout_bij_sluiten_na_volledige_regel_geeft_geen_dubbel_nummer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """De regel staat al op schijf als het sluiten faalt; de volgende append telt hem mee."""
+    pad = tmp_path / "audit.jsonl"
+    log = Auditlog(pad, "lindevoort")
+    log.schrijf_uitgaand(1, {"gebeurtenis": "verzoek"})
+    grens = VolVolume(monkeypatch, pad, deel=None, sluiten_faalt=True)
+    with pytest.raises(OSError, match="Input/output"):
+        log.schrijf_uitgaand(2, {"gebeurtenis": "uitgegeven"})
+    grens.actief = False
+    assert log.schrijf_uitgaand(2, {"gebeurtenis": "uitgegeven"}) is None  # stond er al
+    log.schrijf(gebeurtenis="daarna")
+    records = lees(pad)
+    assert [(r["nr"], r.get("uitgaand")) for r in records] == [(1, 1), (2, 2), (3, None)]
+    assert controleer(records) == (True, "intact")
+
+
+def test_volledige_regel_die_niet_terug_te_zetten_is_wordt_niet_dubbel_geschreven(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """fsync faalt na een volledige regel en ook het terugzetten mislukt: de regel blijft staan."""
+    pad = tmp_path / "audit.jsonl"
+    log = Auditlog(pad, "lindevoort")
+    log.schrijf_uitgaand(1, {"gebeurtenis": "verzoek"})
+    grens = VolVolume(monkeypatch, pad, deel=None, truncate_faalt=True)
+    echt_fsync, fouten = os.fsync, [OSError(5, "Input/output error")]
+
+    def fsync(fd: int) -> None:
+        if fouten:
+            raise fouten.pop()
+        echt_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    with pytest.raises(OSError, match="Input/output") as info:
+        log.schrijf_uitgaand(2, {"gebeurtenis": "uitgegeven"})
+    assert "terugzetten van het auditlog mislukte ook" in " ".join(info.value.__notes__)
+    grens.actief = False
+    assert log.schrijf_uitgaand(2, {"gebeurtenis": "uitgegeven"}) is None  # stond er al
+    log.schrijf(gebeurtenis="daarna")
+    records = lees(pad)
+    assert [(r["nr"], r.get("uitgaand")) for r in records] == [(1, 1), (2, 2), (3, None)]
     assert controleer(records) == (True, "intact")
 
 

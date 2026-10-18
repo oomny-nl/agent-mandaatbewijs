@@ -88,13 +88,21 @@ def audit(uitgever: Dienst) -> list[dict[str, Any]]:
 class VolVolume:
     """Bestandsgrens die bij `ab` eerst `deel` bytes schrijft en dan `OSError(28)` geeft.
 
-    Met `truncate_faalt` mislukt ook het terugzetten. Alleen appends op `pad` worden geraakt.
+    Met `truncate_faalt` mislukt ook het terugzetten. Met `deel=None` slaagt het schrijven
+    volledig; `sluiten_faalt` geeft dan na het sluiten `OSError(5)`. Alleen appends op `pad`
+    worden geraakt.
     """
 
     def __init__(
-        self, monkeypatch: pytest.MonkeyPatch, pad: Path, deel: int, truncate_faalt: bool = False
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        pad: Path,
+        deel: int | None,
+        truncate_faalt: bool = False,
+        sluiten_faalt: bool = False,
     ) -> None:
-        self.pad, self.deel, self.truncate_faalt, self.actief = pad, deel, truncate_faalt, True
+        self.pad, self.deel, self.actief = pad, deel, True
+        self.truncate_faalt, self.sluiten_faalt = truncate_faalt, sluiten_faalt
         echt = Path.open
 
         def open_(p: Path, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
@@ -113,8 +121,12 @@ class _Half:
 
     def __exit__(self, *_: object) -> None:
         self.f.close()
+        if self.grens.sluiten_faalt:
+            raise OSError(5, "Input/output error")
 
     def write(self, data: bytes) -> int:
+        if self.grens.deel is None:
+            return self.f.write(data)
         self.f.write(data[: self.grens.deel])
         self.f.flush()
         raise OSError(28, "No space left on device")

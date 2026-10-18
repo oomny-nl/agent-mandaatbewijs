@@ -11,9 +11,11 @@ opruimen van de outbox afbrak. Zo'n event draagt zijn eigen `tijd` (het moment v
 `geschreven` is het moment waarop het in het log kwam.
 
 Een append telt pas als de regel volledig en met `fsync` op schijf staat. Mislukt hij halverwege
-(vol volume, I/O-fout), dan zet het log het bestand terug op de lengte van vóór de poging. Een
-onvolledige laatste regel na een crash midden in een append is nooit bevestigd; het log verwijdert
-hem bij de start. De outbox schrijft zo'n event daarna opnieuw.
+(vol volume, I/O-fout), dan zet het log het bestand terug op de lengte van vóór de poging. Na
+elke mislukte append, ook een fout bij het sluiten, leidt de volgende append nummer en kop opnieuw
+af uit het bestand. Een onvolledige laatste regel na een crash midden in een append is nooit
+bevestigd; het log verwijdert hem bij de start of bij dat herstel. De outbox schrijft zo'n event
+daarna opnieuw; een event dat wel volledig in het log staat, schrijft hij niet nog eens.
 """
 
 from __future__ import annotations
@@ -45,7 +47,11 @@ def ketenhash(vorige: str, record: dict[str, Any]) -> str:
 
 
 class Auditlog:
-    """Append-only JSONL-log met hashketen; thread-veilig binnen één proces, mits één object."""
+    """Append-only JSONL-log met hashketen.
+
+    Aanname: één schrijvend proces en één `Auditlog`-object per bestand. De lock en de
+    teller zijn per object; twee objecten of processen op hetzelfde bestand breken de keten.
+    """
 
     def __init__(self, pad: Path, organisatie: str) -> None:
         self.pad = pad
@@ -108,29 +114,34 @@ class Auditlog:
         }
         record["hash"] = ketenhash(self._kop, record)
         regel = (json.dumps(record, ensure_ascii=False) + "\n").encode()
-        with self.pad.open("ab") as f:
-            begin = f.tell()
-            try:
-                f.write(regel)
-                f.flush()
-                os.fsync(f.fileno())
-            except BaseException as fout:
-                self._zet_terug(f, begin, fout)
-                raise
+        try:
+            with self.pad.open("ab") as f:
+                begin = f.tell()
+                try:
+                    f.write(regel)
+                    f.flush()
+                    os.fsync(f.fileno())
+                except BaseException as fout:
+                    self._zet_terug(f, begin, fout)
+                    raise
+        except BaseException:
+            # Ook een fout bij het openen of sluiten: of de regel er staat, weet alleen het bestand.
+            self._herstel_nodig = True
+            raise
         self._nr, self._kop = record["nr"], record["hash"]
         return record
 
-    def _zet_terug(self, f: Any, begin: int, fout: BaseException) -> None:
+    @staticmethod
+    def _zet_terug(f: Any, begin: int, fout: BaseException) -> None:
         """Zet het bestand terug op `begin` na een mislukte append.
 
-        Lukt ook dat niet, dan leest de volgende append de kop eerst opnieuw uit het bestand.
+        Lukt ook dat niet, dan verwijdert de volgende append de halve regel (zie `_herlaad`).
         """
         try:
             f.truncate(begin)
             f.flush()
             os.fsync(f.fileno())
         except OSError as tweede:
-            self._herstel_nodig = True
             fout.add_note(f"terugzetten van het auditlog mislukte ook: {tweede}")
 
 

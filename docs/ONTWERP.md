@@ -306,11 +306,15 @@ De verifier heeft drie bronnen, alle publiek en gecachet:
   4.4). Cache 300 seconden, of korter volgens `Cache-Control` en `Age` (RFC 9111: richtlijnen zijn
   hoofdletterongevoelig, `max-age` mag gequote zijn, en `no-store` en `no-cache` geven nul omdat
   deze cache niet hervalideert), ook voor een `jwks` die inline in de metadata staat. De grens is
-  het begin van de ophaalactie plus die duur min `Age` (RFC 9111 §4.2.3: zo tellen de tijd in een
-  tussenliggende HTTP-cache en de transporttijd mee, zonder op de klok van de uitgever te leunen);
-  een ongeldige of dubbele `Age` geeft nul. Bij `jwks_uri` geldt de kortste grens van metadata en
-  JWKS. Bij nul, of als de grens bij aankomst al voorbij is, geldt
-  de opgehaalde JWKS alleen voor de aanvraag die haar ophaalde en wordt niets bewaard. Metadata met zowel `jwks` als `jwks_uri` is onjuist. Alleen een sleutel
+  het begin van de ophaalactie plus die duur min de ouderdom van het antwoord (RFC 9111 §4.2.3: zo
+  tellen de tijd in een tussenliggende HTTP-cache en de transporttijd mee, zonder op de klok van
+  de uitgever te leunen). De ouderdom is `Age` plus één seconde, want `Age` telt hele seconden en
+  een cache rondt naar beneden af (gemeten met Varnish 7.7: na 0,99 s nog `Age: 0`); zonder `Age`
+  is ze nul. Een ongeldige of dubbele `Age` geeft nul; dat is eigen beleid, strenger dan RFC 9111
+  §5.1, die de eerste waarde neemt en een ongeldige negeert. Bij `jwks_uri` geldt de kortste grens
+  van metadata en JWKS. Bij nul, of als de grens bij aankomst al voorbij is, geldt de opgehaalde
+  JWKS alleen voor de aanvraag die haar ophaalde en wordt niets bewaard. Metadata met zowel `jwks`
+  als `jwks_uri` is onjuist. Alleen een sleutel
   uit een nog geldige cache of uit een zojuist geslaagde ophaalactie is bruikbaar. De verifier
   haalt per uitgever hoogstens eens per 10 seconden op, ook als de cache leeg of verlopen is, en
   gelijktijdige aanvragen wachten op die ene ophaalactie. Binnen die 10 seconden wordt
@@ -412,11 +416,12 @@ demo `ttl` op 5 seconden en `exp` op `iat + 60`; de instellingen `STATUSLIJST_TT
   na afloop van de vorige ronde, los van het presentatiemoment (ARF VCR_15); een presentatie
   veroorzaakt alleen een ophaalactie als er geen bruikbare cache is;
 - gebruikt een gecachete lijst alleen als **beide** gelden: `opgehaald + ttl > nu` **en**
-  `nu < exp` van het gecachete token, met `opgehaald` het begin van de download min de `Age` van
-  het antwoord (RFC 9111 §4.2.3; een trage download of een tussenliggende HTTP-cache verlengt de
-  cache dus niet). Een token dat op seconde 59 is opgehaald met `exp = 60` en `ttl = 5` is op
-  seconde 62 dus onbruikbaar, ook al is de `ttl` niet om. Een ongeldige of dubbele `Age` telt als
-  oneindig oud. Een token dat bij aankomst al ouder is dan `ttl`, wordt wel bewaard (het kan een
+  `nu < exp` van het gecachete token, met `opgehaald` het begin van de download min de ouderdom
+  van het antwoord (`Age` plus één seconde, zie de JWKS hierboven; RFC 9111 §4.2.3: een trage
+  download of een tussenliggende HTTP-cache verlengt de cache dus niet). Een token dat op seconde
+  59 is opgehaald met `exp = 60` en `ttl = 5` is op seconde 62 dus onbruikbaar, ook al is de `ttl`
+  niet om. Een ongeldige of dubbele `Age` telt als oneindig oud (eigen beleid, strenger dan RFC
+  9111 §5.1). Een token dat bij aankomst al ouder is dan `ttl`, wordt wel bewaard (het kan een
   intrekking bevatten), maar telt als mislukte verversing: hoogstens overbrugging tot `exp`, nooit
   `vers`. Hetzelfde token opnieuw met meer `Age` verkort de cache niet;
 - haalt anders een nieuwe op. Lukt dat **niet** door een netwerk- of HTTP-fout (geen antwoord,
@@ -450,10 +455,19 @@ aanroep die om T + `ttl` of later begint, geweigerd. Een cache die vóór T is o
 verlopen, en een download die na T begint, krijgt een token met de nieuwe bit, want na een
 intrekking tekent de uitgever altijd opnieuw. Dat geldt ook met een HTTP-cache tussen verifier en
 uitgever die zich aan RFC 9111 houdt en bij een opgeslagen antwoord `Age` meestuurt: de verifier
-telt die ouderdom mee. Een cache die een opgeslagen antwoord zonder `Age` levert (in strijd met
-RFC 9111 §4), kan het venster met zijn eigen bewaartijd verlengen, bij `max-age=ttl` tot
-T + 2 × `ttl` en nooit voorbij `exp`; dat valt buiten deze garantie. Een aanroep die eerder begint, kan nog worden
-toegelaten; de achtergrondverversing maakt dat venster in de praktijk korter, maar de grens volgt
+telt die ouderdom mee, met één seconde extra voor de afronding. Elke cache in een keten rondt af,
+dus achter n caches kan de werkelijke ouderdom tot n seconden boven `Age` liggen; de garantie geldt
+voor één cache. Een cache die een opgeslagen antwoord zonder `Age` levert (in strijd met RFC 9111
+§4), kan het venster met zijn eigen bewaartijd verlengen, bij `max-age=ttl` tot T + 2 × `ttl` en
+nooit voorbij `exp`; dat valt buiten deze garantie. Een cache die een verlopen antwoord levert
+(Varnish-grace, standaard 10 seconden, of `stale-while-revalidate`), stuurt een token dat bij
+aankomst al ouder is dan `ttl`. De verifier behandelt dat als een mislukte verversing: voor die
+aanroep schuift de grens, net als bij een onbereikbare uitgever, op tot `exp`. Wie de grens van
+T + `ttl` wil houden, zet grace voor de statuslijst op nul (de demo slaagt achter Varnish 7.7 met
+`default_grace=0` en faalt met de standaard van 10 seconden). Door de afrondingsseconde telt bij
+`max-age` gelijk aan `ttl` ook een niet-verlopen antwoord met `Age: ttl - 1` als te oud. Dat
+token is nog jonger dan `ttl` en wordt gebruikt, dus de grens blijft T + `ttl`; alleen meldt het
+auditrecord dan `cache-verouderd`. Een aanroep die eerder begint, kan nog worden toegelaten; de achtergrondverversing maakt dat venster in de praktijk korter, maar de grens volgt
 uit de cacheregel en niet uit die klok. Antwoordt de uitgever niet of met een fout, dan schuift de
 grens op tot de `exp` van het gecachete token (in de demo `iat` + 60). Een aanroep die al is
 toegelaten, loopt door. De demo roept na de intrekking elke seconde aan, de integratietest elke
