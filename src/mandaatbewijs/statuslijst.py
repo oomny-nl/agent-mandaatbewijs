@@ -19,7 +19,7 @@ from joserfc.errors import JoseError
 from joserfc.jwk import ECKey
 
 from mandaatbewijs.sdjwt import ALG, b64url, b64url_decode
-from mandaatbewijs.sleutels import Sleutelpaar
+from mandaatbewijs.sleutels import Sleutelpaar, jose_kop
 
 TYP = "statuslist+jwt"
 MEDIATYPE = "application/statuslist+jwt"
@@ -152,8 +152,8 @@ class Statustoken:
 
 def _claims_uit_token(token: str, sleutel: ECKey) -> dict[str, Any]:
     try:
-        kop = jws.extract_compact(token.encode()).protected
-    except (JoseError, ValueError) as fout:
+        kop = jose_kop(token)
+    except ValueError as fout:
         raise StatuslijstFout("token_ongeldig", str(fout)) from fout
     if kop.get("typ") != TYP:
         raise StatuslijstFout("typ_onjuist", str(kop.get("typ")))

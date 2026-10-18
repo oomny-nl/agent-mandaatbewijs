@@ -25,7 +25,7 @@ from tests.integratie.conftest import (
     inkomen,
     nonce,
     presentatie,
-    wacht_tot,
+    tot_weigering,
 )
 
 pytestmark = pytest.mark.integratie
@@ -120,19 +120,16 @@ def test_gelijktijdige_replay_slaagt_precies_een_keer(
     assert {u.reden for u in uitkomsten if u.status == 401} == {"nonce_onbekend_of_gebruikt"}
 
 
-def test_ingetrokken_via_statuslijst_binnen_ttl(omgeving: Omgeving, verleen: Verlener) -> None:
+def test_ingetrokken_geen_toegang_meer_na_ttl(omgeving: Omgeving, verleen: Verlener) -> None:
     m = verleen(["2026-0142"])
     assert inkomen(aanroep(omgeving, presentatie(omgeving, m.agent, "2026-0142"), "2026-0142"))
     ingetrokken_op = omgeving.portaal().trek_in(m.mandaat_id)
-
-    def geweigerd() -> bool:
-        u = aanroep(omgeving, presentatie(omgeving, m.agent, "2026-0142"), "2026-0142")
-        assert u.status in (200, 403), u
-        assert u.status == 200 or u.reden == "mandaat_ingetrokken"
-        return u.status == 403
-
-    wacht_tot(geweigerd, omgeving.status_ttl + 2)
-    assert time.time() - ingetrokken_op <= omgeving.status_ttl + 2
+    u = tot_weigering(
+        lambda: aanroep(omgeving, presentatie(omgeving, m.agent, "2026-0142"), "2026-0142"),
+        ingetrokken_op,
+        omgeving.status_ttl,
+    )
+    assert (u.status, u.reden) == (403, "mandaat_ingetrokken")
     record = omgeving.audit("register")[-1]
     assert (record["gebeurtenis"], record["reden"], record["jti"]) == (
         "geweigerd",
@@ -174,17 +171,17 @@ def test_noodstop_blokkeert_sleutel(omgeving: Omgeving, verleen: Verlener) -> No
     m = verleen(["2026-0142"])
     assert inkomen(aanroep(omgeving, presentatie(omgeving, m.agent, "2026-0142"), "2026-0142"))
     ingetrokken = omgeving.portaal("kees").noodstop(m.agent.jkt)
+    ingetrokken_op = time.time()
     assert ingetrokken == [m.mandaat_id]
     with pytest.raises(PortemonneeFout, match="sleutel_geblokkeerd"):
         m.agent.vraag_mandaat("sanne", "heronderzoek", ["inkomen:lezen"], ["2026-0142"])
 
-    def geweigerd() -> bool:
-        return (
-            aanroep(omgeving, presentatie(omgeving, m.agent, "2026-0142"), "2026-0142").status
-            == 403
-        )
-
-    wacht_tot(geweigerd, omgeving.status_ttl + 2)
+    u = tot_weigering(
+        lambda: aanroep(omgeving, presentatie(omgeving, m.agent, "2026-0142"), "2026-0142"),
+        ingetrokken_op,
+        omgeving.status_ttl,
+    )
+    assert (u.status, u.reden) == (403, "mandaat_ingetrokken")
     nieuw = verleen(["2026-0142"])  # met een nieuw sleutelpaar werkt het weer
     assert inkomen(aanroep(omgeving, presentatie(omgeving, nieuw.agent, "2026-0142"), "2026-0142"))
 

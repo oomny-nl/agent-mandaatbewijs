@@ -1,34 +1,53 @@
-"""Fictieve gegevens van het Landelijk Inkomensregister (LIR), per gemeentelijk dossiernummer."""
+"""Fictieve gegevens van het Landelijk Inkomensregister (LIR).
+
+Een dossiernummer is gemeentelijk: hetzelfde nummer bij twee gemeenten is een ander dossier. Het
+register zoekt daarom op (gemeente, dossiernummer), met de gemeente zoals de vertrouwenslijst haar
+noemt bij de geverifieerde `iss`.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 VERIFIER_NAAM = "Landelijk Inkomensregister (fictief)"
+LINDEVOORT = "Gemeente Lindevoort (fictief)"
+ELSWEERD = "Gemeente Elsweerd (fictief)"
 
-INKOMENS: dict[str, dict[str, object]] = {
-    "2026-0142": {
+INKOMENS: dict[tuple[str, str], dict[str, object]] = {
+    (LINDEVOORT, "2026-0142"): {
         "dossier": "2026-0142",
         "periode": "2026-07 t/m 2026-09",
         "bron": "loonaangifte",
         "bruto_per_maand": 1430.00,
         "werkgever": "Schoonmaakbedrijf Helder B.V.",
     },
-    "2026-0143": {
+    (LINDEVOORT, "2026-0143"): {
         "dossier": "2026-0143",
         "periode": "2026-07 t/m 2026-09",
         "bron": "loonaangifte",
         "bruto_per_maand": 0.00,
         "werkgever": None,
     },
-    "2026-0157": {
+    (LINDEVOORT, "2026-0157"): {
         "dossier": "2026-0157",
         "periode": "2026-07 t/m 2026-09",
         "bron": "loonaangifte",
         "bruto_per_maand": 2875.00,
         "werkgever": "Transportgroep Van Dijk",
     },
+    (ELSWEERD, "2026-0142"): {
+        "dossier": "2026-0142",
+        "periode": "2026-07 t/m 2026-09",
+        "bron": "uitkering",
+        "bruto_per_maand": 1210.00,
+        "werkgever": None,
+    },
 }
+
+
+def inkomen(gemeente: str, dossier: str) -> dict[str, object] | None:
+    """Inkomensgegevens bij een gemeentelijk dossier, of None als het register het niet kent."""
+    return INKOMENS.get((gemeente, dossier))
 
 
 @dataclass(frozen=True)

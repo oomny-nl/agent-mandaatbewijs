@@ -1,4 +1,10 @@
-"""De acht verificatiestappen van ONTWERP §7, in volgorde; de eerste weigering telt."""
+"""De acht verificatiestappen van ONTWERP §7, in volgorde; de eerste weigering telt.
+
+Na de cryptografische controle toetst de verifier het mandaatprofiel: `jti` is een niet-lege
+string, `iat` en `nbf` zijn gehele getallen, `acties` en `dossiers` zijn lijsten van strings en
+`doel` is, als het bekend is gemaakt, een string. Een credential die daar niet aan voldoet, wordt
+geweigerd, ook als de handtekening klopt.
+"""
 
 from __future__ import annotations
 
@@ -19,8 +25,9 @@ class Weigering(Exception):
     Attributes:
         reden: Korte code voor audit en `WWW-Authenticate`.
         status: HTTP-status (401 voor de presentatie zelf, 403 voor het bereik).
-        bevestigd: Gegevens uit de geverifieerde credential (na de handtekening van de
-            uitgever), voor het auditrecord; bij een weigering ná stap 5 minstens `iss` en `jti`.
+        bevestigd: Gegevens die de verifier heeft vastgesteld (uit de geverifieerde credential
+            en het eigen toolbeleid), voor het auditrecord; bij een weigering ná stap 5 minstens
+            `iss`, `jti`, `jkt` en de bekendgemaakte claimnamen, na stap 6 ook de statusbron.
         onbevestigd: Gegevens uit nog niet gevalideerde delen, voor het auditrecord.
     """
 
@@ -111,6 +118,7 @@ class Verificatie:
             g = verifieer(o, sleutel, self.aud)
         except SdJwtFout as fout:
             raise Weigering(fout.reden, 401, fout.detail, iss=o.iss) from fout
+        _controleer_profiel(g)
         if not self.nonces.verbruik(g.nonce):
             raise Weigering("nonce_onbekend_of_gebruikt", 401, bevestigd=_bevestigd(g))
         return g
@@ -127,34 +135,76 @@ class Verificatie:
             raise Weigering(fout.reden, 401, str(fout), bevestigd=bevestigd) from fout
         if uitkomst.waarde != GELDIG:
             raise Weigering(
-                "mandaat_ingetrokken", 403, f"status {uitkomst.waarde}", bevestigd=bevestigd
+                "mandaat_ingetrokken",
+                403,
+                f"status {uitkomst.waarde}",
+                bevestigd={**bevestigd, "status_bron": uitkomst.bron},
             )
         return uitkomst.bron
 
 
 def _bevestigd(g: Geverifieerd) -> dict[str, Any]:
-    """`iss`, `jti` en sleutel-thumbprint uit een credential waarvan de handtekening klopt."""
-    return {"iss": g.claims.get("iss"), "jti": g.claims.get("jti"), "jkt": g.jkt}
+    """`iss`, `jti`, thumbprint en bekendgemaakte claimnamen uit een geverifieerde credential."""
+    return {
+        "iss": g.claims.get("iss"),
+        "jti": g.claims.get("jti"),
+        "jkt": g.jkt,
+        "bekendgemaakt": g.bekendgemaakt,
+    }
+
+
+def _is_geheel(waarde: Any) -> bool:
+    return isinstance(waarde, int) and not isinstance(waarde, bool)
+
+
+def _is_tekstlijst(waarde: Any) -> bool:
+    return isinstance(waarde, list) and all(isinstance(x, str) for x in waarde)
+
+
+def _controleer_profiel(g: Geverifieerd) -> None:
+    """Het mandaatprofiel (zie de moduledocstring); `jti` is de sleutel van het auditbewijs."""
+    c = g.claims
+    fouten = [
+        naam
+        for naam, goed in (
+            ("jti", isinstance(c.get("jti"), str) and bool(c["jti"])),
+            ("iat", _is_geheel(c.get("iat"))),
+            ("nbf", _is_geheel(c.get("nbf"))),
+            ("acties", _is_tekstlijst(c.get("acties"))),
+            ("dossiers", _is_tekstlijst(c.get("dossiers"))),
+            ("doel", "doel" not in c or isinstance(c["doel"], str)),
+        )
+        if not goed
+    ]
+    if fouten:
+        bevestigd = {"iss": c.get("iss"), "jkt": g.jkt, "bekendgemaakt": g.bekendgemaakt}
+        if isinstance(c.get("jti"), str):
+            bevestigd["jti"] = c["jti"]
+        raise Weigering(
+            "profiel_ongeldig",
+            401,
+            f"ontbreekt of verkeerd type: {', '.join(fouten)}",
+            bevestigd=bevestigd,
+        )
 
 
 def _toelating(
     g: Geverifieerd, naam: str, beleid: Toolbeleid, dossier: str, status_bron: str
 ) -> Toelating:
     claims = g.claims
-    jti = str(claims.get("jti", ""))
     actie = beleid.actie
-    bevestigd = _bevestigd(g)
-    if actie not in _lijst(claims.get("acties")):
+    bevestigd = {**_bevestigd(g), "status_bron": status_bron, "actie": actie}
+    if actie not in claims["acties"]:
         raise Weigering("actie_buiten_mandaat", 403, actie, bevestigd=bevestigd)
-    if dossier not in _lijst(claims.get("dossiers")):
+    if dossier not in claims["dossiers"]:
         raise Weigering("dossier_buiten_mandaat", 403, dossier, bevestigd=bevestigd)
     doel = claims.get("doel")
-    if not isinstance(doel, str) or doel not in beleid.doelen:
+    if doel not in beleid.doelen:
         raise Weigering("doel_niet_geaccepteerd", 403, str(doel), bevestigd=bevestigd)
     return Toelating(
         iss=str(claims["iss"]),
         uitgever=naam,
-        jti=jti,
+        jti=claims["jti"],
         jkt=g.jkt,
         doel=doel,
         actie=actie,
@@ -163,7 +213,3 @@ def _toelating(
         status_bron=status_bron,
         nonce=g.nonce,
     )
-
-
-def _lijst(waarde: Any) -> list[str]:
-    return [str(x) for x in waarde] if isinstance(waarde, list) else []

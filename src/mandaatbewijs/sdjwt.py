@@ -1,4 +1,4 @@
-"""SD-JWT (draft-ietf-oauth-selective-disclosure-jwt-22) en het SD-JWT VC-profiel (draft-19).
+"""SD-JWT (RFC 9901) en het SD-JWT VC-profiel (draft-ietf-oauth-sd-jwt-vc-19).
 
 Drie rollen, drie functies:
 
@@ -6,9 +6,11 @@ Drie rollen, drie functies:
   array-elementen en decoy-digests;
 - houder: `presenteer` kiest disclosures en tekent een key binding JWT (`kb+jwt`) met `aud`,
   `nonce` en `sd_hash`;
-- verifier: `ontleed` en `verifieer` volgen §7.1 en §7.3 van de draft: elke disclosure hoort bij
-  precies één digest, geen dubbele claimnamen, geen `_sd` of `...` als claimnaam, verlopen of
-  nog niet geldige tokens worden geweigerd.
+- verifier: `ontleed` en `verifieer` volgen RFC 9901 §7.1 en §7.3: elke disclosure hoort bij
+  precies één digest, geen claimnaam die al op hetzelfde niveau staat, geen `_sd`, `...` of
+  `_sd_alg` als claimnaam, `_sd_alg` alleen op het hoogste niveau, `...` alleen als enige sleutel
+  van een array-element, strikte base64url, en verlopen, nog niet geldige of voor een andere
+  ontvanger bestemde credentials worden geweigerd.
 
 De digest is SHA-256 over de US-ASCII-bytes van de base64url-gecodeerde disclosure (§4.2.3).
 """
@@ -18,16 +20,18 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 import secrets
 import time
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from joserfc import jws
 from joserfc.errors import JoseError
 from joserfc.jwk import ECKey
 
-from mandaatbewijs.sleutels import ALG, Sleutelpaar, publieke_sleutel
+from mandaatbewijs.sleutels import ALG, Sleutelpaar, jose_kop, publieke_sleutel
 
 TYP_VC = "dc+sd-jwt"
 TYP_KB = "kb+jwt"
@@ -35,6 +39,8 @@ SD_ALG = "sha-256"
 KLOKMARGE_S = 30
 KB_GELDIGHEID_S = 60
 MAX_PRESENTATIE = 16 * 1024
+METADATA_PAD = "/.well-known/jwt-vc-issuer"
+_BASE64URL = re.compile(r"[A-Za-z0-9_-]*")
 
 
 class SdJwtFout(Exception):
@@ -52,8 +58,20 @@ def b64url(data: bytes) -> str:
 
 
 def b64url_decode(tekst: str) -> bytes:
-    """Base64url-decodering met aangevuld padding."""
-    return base64.urlsafe_b64decode(tekst + "=" * (-len(tekst) % 4))
+    """Strikte base64url-decodering zonder padding (RFC 9901 §4 via RFC 7515 §2).
+
+    Weigert padding, witruimte en andere tekens (die `urlsafe_b64decode` stil overslaat), een
+    onmogelijke lengte en een niet-canonieke vorm met opvulbits die niet nul zijn.
+
+    Raises:
+        ValueError: Als de tekst geen canonieke base64url zonder padding is.
+    """
+    if not _BASE64URL.fullmatch(tekst) or len(tekst) % 4 == 1:
+        raise ValueError("geen base64url zonder padding")
+    data = base64.urlsafe_b64decode(tekst + "=" * (-len(tekst) % 4))
+    if b64url(data) != tekst:
+        raise ValueError("niet-canonieke base64url: opvulbits zijn niet nul")
+    return data
 
 
 def digest(disclosure: str) -> str:
@@ -62,10 +80,27 @@ def digest(disclosure: str) -> str:
 
 
 # SD-JWT VC §2.2.2.3 (iss, nbf, exp, cnf, vct, vct#integrity, status) plus dit mandaatprofiel
-# (iat, jti) en het niet-ondersteunde aka_vcts; ook hun subclaims mogen niet selectief zijn.
+# (iat, jti, en aud: een verborgen aud zou de houder laten kiezen of de verifier haar ziet) en het
+# niet-ondersteunde aka_vcts; ook hun subclaims mogen niet selectief zijn.
 NIET_DISCLOSABLE = frozenset(
-    {"iss", "vct", "vct#integrity", "aka_vcts", "jti", "iat", "nbf", "exp", "cnf", "status"}
+    {"iss", "vct", "vct#integrity", "aka_vcts", "jti", "iat", "nbf", "exp", "cnf", "status", "aud"}
 )
+
+
+def metadata_url(iss: str) -> str:
+    """URL van de uitgeversmetadata: het well-known-pad vóór het pad van `iss` (SD-JWT VC §4).
+
+    `https://example.com/tenant/1234` wordt `https://example.com/.well-known/jwt-vc-issuer/tenant/1234`;
+    een afsluitende `/` valt weg (§4.1).
+
+    Raises:
+        ValueError: Als `iss` een query of fragment heeft, wat §4 uitsluit.
+    """
+    delen = urlsplit(iss)
+    if delen.query or delen.fragment or "?" in iss or "#" in iss:
+        raise ValueError(f"iss {iss!r} mag geen query of fragment hebben")
+    pad = METADATA_PAD + delen.path.rstrip("/")
+    return urlunsplit((delen.scheme, delen.netloc, pad, "", ""))
 
 
 @dataclass(frozen=True)
@@ -282,7 +317,9 @@ class Geverifieerd:
 
 def _splits(serialisatie: str) -> tuple[str, list[Disclosure], str]:
     if len(serialisatie) > MAX_PRESENTATIE:
-        raise SdJwtFout("presentatie_te_groot", f"meer dan {MAX_PRESENTATIE} bytes")
+        raise SdJwtFout("presentatie_te_groot", f"meer dan {MAX_PRESENTATIE} tekens")
+    if not serialisatie.isascii():
+        raise SdJwtFout("presentatie_ongeldig", "bevat tekens buiten US-ASCII")
     delen = serialisatie.split("~")
     if len(delen) < 2:
         raise SdJwtFout("presentatie_ongeldig", "geen ~ gevonden")
@@ -313,10 +350,10 @@ def ontleed(presentatie: str) -> Ontleed:
     if not kb:
         raise SdJwtFout("kb_ontbreekt", "presentatie zonder key binding JWT")
     try:
-        kop = jws.extract_compact(jwt.encode()).protected
-    except (JoseError, ValueError) as fout:
+        kop = jose_kop(jwt)
+    except ValueError as fout:
         raise SdJwtFout("jwt_ongeldig", str(fout)) from fout
-    return Ontleed(jwt, disclosures, kb, dict(kop), _payload_zonder_controle(jwt))
+    return Ontleed(jwt, disclosures, kb, kop, _payload_zonder_controle(jwt))
 
 
 def _controleer_kop(kop: dict[str, Any], typ: str) -> None:
@@ -328,8 +365,8 @@ def _controleer_kop(kop: dict[str, Any], typ: str) -> None:
 
 def _verifieer_jws(jwt: str, sleutel: ECKey, typ: str) -> dict[str, Any]:
     try:
-        kop = dict(jws.extract_compact(jwt.encode()).protected)
-    except (JoseError, ValueError) as fout:
+        kop = jose_kop(jwt)
+    except ValueError as fout:
         raise SdJwtFout("jwt_ongeldig", f"{typ}: {fout}") from fout
     _controleer_kop(kop, typ)
     try:
@@ -380,33 +417,38 @@ class _Verwerker:
     def verwerk(self, waarde: Any, naam: str | None = None) -> Any:
         """Verwerk een JSON-waarde recursief; `naam` is de claim waar de waarde onder hangt."""
         if isinstance(waarde, dict):
-            return self._object(waarde)
+            return self.object(waarde)
         if isinstance(waarde, list):
             return self._lijst(waarde, naam)
         return waarde
 
-    def _object(self, obj: dict[str, Any]) -> dict[str, Any]:
+    def object(self, obj: dict[str, Any], bovenste: bool = False) -> dict[str, Any]:
+        """Verwerk een object; alleen het `bovenste` (de payload zelf) mag `_sd_alg` hebben."""
+        if "_sd_alg" in obj and not bovenste:
+            raise SdJwtFout("sd_alg_ongeldig", "_sd_alg mag alleen op het hoogste niveau staan")
+        if "..." in obj:
+            raise SdJwtFout("sd_ongeldig", "... hoort alleen als enige sleutel in array-element")
         uit: dict[str, Any] = {}
         for naam, waarde in obj.items():
-            if naam in ("_sd", "_sd_alg"):
-                continue
-            uit[naam] = self.verwerk(waarde, naam)
+            if naam not in ("_sd", "_sd_alg"):
+                uit[naam] = self.verwerk(waarde, naam)
         sd = obj.get("_sd", [])
         if not isinstance(sd, list) or not all(isinstance(x, str) for x in sd):
             raise SdJwtFout("sd_ongeldig", "_sd is geen lijst van strings")
         for dig in sd:
             d = self._neem(dig)
             if d is not None:
-                naam = self._claimnaam(d, uit)
+                naam = self._claimnaam(d, obj, uit)
                 uit[naam] = self.verwerk(d.waarde, naam)
                 self._noteer(naam)
         return uit
 
     @staticmethod
-    def _claimnaam(d: Disclosure, uit: dict[str, Any]) -> str:
+    def _claimnaam(d: Disclosure, obj: dict[str, Any], uit: dict[str, Any]) -> str:
+        """Claimnaam van een objectdisclosure; botsingen gelden met de ontvangen sleutels (§7.1)."""
         if d.naam is None:
             raise SdJwtFout("disclosure_ongeldig", "objectdisclosure zonder claimnaam")
-        if d.naam in ("_sd", "...") or d.naam in uit:
+        if d.naam in ("_sd", "...", "_sd_alg") or d.naam in obj or d.naam in uit:
             raise SdJwtFout("claimnaam_ongeldig", f"claimnaam {d.naam!r} is niet toegestaan")
         if d.naam in NIET_DISCLOSABLE:
             raise SdJwtFout("claimnaam_ongeldig", f"{d.naam!r} mag niet selectief zijn")
@@ -459,7 +501,7 @@ def verwerk_payload(
     if beschermd:
         raise SdJwtFout("claimnaam_ongeldig", f"selectieve subclaims in {', '.join(beschermd)}")
     verwerker = _Verwerker(disclosures)
-    claims = verwerker.verwerk(payload)
+    claims = verwerker.object(payload, bovenste=True)
     ongebruikt = set(verwerker.per_digest) - verwerker.gebruikt
     if ongebruikt:
         raise SdJwtFout("disclosure_onbekend", f"{len(ongebruikt)} disclosure(s) horen nergens bij")
@@ -478,7 +520,7 @@ def _verifieer_kb(ontleed_: Ontleed, cnf_jwk: dict[str, Any], aud: str, nu: int)
     if kb.get("aud") != aud:
         raise SdJwtFout("aud_onjuist", f"kb aud {kb.get('aud')!r} is niet {aud!r}")
     iat = kb.get("iat")
-    if not isinstance(iat, int) or abs(nu - iat) > KB_GELDIGHEID_S:
+    if type(iat) is not int or abs(nu - iat) > KB_GELDIGHEID_S:
         raise SdJwtFout("kb_verlopen", f"iat {iat!r} buiten {KB_GELDIGHEID_S} s")
     if kb.get("sd_hash") != sd_hash(ontleed_.jwt, ontleed_.disclosures):
         raise SdJwtFout("sd_hash_onjuist", "kb hoort niet bij deze set disclosures")
@@ -536,8 +578,20 @@ def _controleer_status_claim(claims: dict[str, Any]) -> None:
         raise SdJwtFout("status_ongeldig", "uri is geen string")
 
 
+def _controleer_aud(claims: dict[str, Any], aud: str) -> None:
+    """Een aanwezige `aud` in de credential moet de verifier noemen (RFC 7519 §4.1.3)."""
+    if "aud" not in claims:
+        return
+    waarde = claims["aud"]
+    ontvangers = [waarde] if isinstance(waarde, str) else waarde
+    if not isinstance(ontvangers, list) or not all(isinstance(o, str) for o in ontvangers):
+        raise SdJwtFout("aud_onjuist", "credential-aud is geen tekst of lijst van teksten")
+    if aud not in ontvangers:
+        raise SdJwtFout("aud_onjuist", f"credential is bestemd voor {waarde!r}, niet voor {aud!r}")
+
+
 def verifieer(ontleed_: Ontleed, sleutel: ECKey, aud: str, nu: int | None = None) -> Geverifieerd:
-    """Verifieer een SD-JWT+KB (§7.3): uitgever, disclosures, tijdvenster en key binding.
+    """Verifieer een SD-JWT+KB (§7.3): uitgever, disclosures, tijdvenster, ontvanger en key binding.
 
     De aanroeper heeft `iss` al tegen zijn vertrouwenslijst getoetst en de sleutel bij `kid`
     opgehaald. De nonce wordt teruggegeven en moet door de aanroeper eenmalig worden verbruikt.
@@ -558,6 +612,7 @@ def verifieer(ontleed_: Ontleed, sleutel: ECKey, aud: str, nu: int | None = None
     payload = _verifieer_jws(ontleed_.jwt, sleutel, TYP_VC)
     claims, bekendgemaakt = verwerk_payload(payload, ontleed_.disclosures)
     _tijdvenster(claims, nu)
+    _controleer_aud(claims, aud)
     cnf = claims.get("cnf")
     if not isinstance(cnf, dict) or not isinstance(cnf.get("jwk"), dict):
         raise SdJwtFout("cnf_ontbreekt", "credential zonder cnf.jwk")

@@ -10,27 +10,26 @@ import json
 import secrets
 from pathlib import Path
 
-from mandaatbewijs.sleutels import Sleutelpaar
+from mandaatbewijs.sleutels import Sleutelpaar, lees_afgeschermd, maak_afgeschermd
 from mandaatbewijs.uitgever.gegevens import MEDEWERKERS
 
 
 def uitgeverssleutel(datamap: Path) -> Sleutelpaar:
-    """Laad de uitgeverssleutel of maak hem bij de eerste start."""
+    """Laad de uitgeverssleutel of maak hem bij de eerste start.
+
+    Na het aanmaken wordt altijd van schijf gelezen, zodat twee gelijktijdige starts dezelfde
+    sleutel gebruiken.
+    """
     pad = datamap / "uitgever.jwk"
-    if pad.exists():
-        return Sleutelpaar.laad(pad)
-    paar = Sleutelpaar.nieuw(kid=f"lindevoort-{secrets.token_hex(4)}")
-    paar.bewaar(pad)
-    return paar
+    if not pad.exists():
+        Sleutelpaar.nieuw(kid=f"lindevoort-{secrets.token_hex(4)}").bewaar(pad)
+    return Sleutelpaar.laad(pad)
 
 
 def wachtwoorden(datamap: Path) -> dict[str, str]:
     """Wachtwoorden van de medewerkers; bij de eerste start willekeurig gegenereerd."""
     pad = datamap / "wachtwoorden.json"
-    if pad.exists():
-        return json.loads(pad.read_text())
-    pad.parent.mkdir(parents=True, exist_ok=True)
-    nieuw = {naam: secrets.token_urlsafe(24) for naam in MEDEWERKERS}
-    pad.write_text(json.dumps(nieuw))
-    pad.chmod(0o600)
-    return nieuw
+    if not pad.exists():
+        nieuw = {naam: secrets.token_urlsafe(24) for naam in MEDEWERKERS}
+        maak_afgeschermd(pad, json.dumps(nieuw))
+    return json.loads(lees_afgeschermd(pad))

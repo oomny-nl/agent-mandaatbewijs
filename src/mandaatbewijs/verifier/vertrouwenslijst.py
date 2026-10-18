@@ -26,9 +26,18 @@ class Uitgever:
 
 
 class Vertrouwenslijst:
-    """Vertrouwde uitgevers op `iss`."""
+    """Vertrouwde uitgevers op `iss`; `iss` en naam zijn elk uniek.
+
+    De naam is de organisatie waaronder de verifier gegevens zoekt (een gemeentelijk dossiernummer
+    hoort bij één gemeente); twee uitgevers met dezelfde naam zouden elkaars dossiers delen.
+    """
 
     def __init__(self, uitgevers: list[Uitgever]) -> None:
+        for veld in ("iss", "naam"):
+            waarden = [getattr(u, veld) for u in uitgevers]
+            dubbel = sorted({w for w in waarden if waarden.count(w) > 1})
+            if dubbel:
+                raise ValueError(f"vertrouwenslijst: {veld} komt meer dan eens voor: {dubbel}")
         self._per_iss = {u.iss: u for u in uitgevers}
 
     @classmethod

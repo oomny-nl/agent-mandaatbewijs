@@ -30,19 +30,26 @@ class MandaatAuth(httpx2.Auth):
     laatste_weigering: str | None = field(default=None, init=False)
 
     def auth_flow(self, request: httpx2.Request) -> Generator[httpx2.Request, httpx2.Response]:
-        """Voeg de presentatie toe aan een `tools/call`."""
+        """Voeg de presentatie toe aan een `tools/call` en onthoud of juist die werd geweigerd.
+
+        `laatste_weigering` hoort altijd bij de laatste `tools/call`: None als die niet met 401
+        of 403 werd geweigerd, anders de WWW-Authenticate-waarde van dat antwoord.
+        """
         methode = None
         if request.content:
             try:
                 methode = json.loads(request.content).get("method")
             except (ValueError, AttributeError):
                 methode = None
-        if methode == "tools/call":
-            gereed, self.volgende = self.volgende, None
-            if gereed is None:
-                raise RuntimeError("tools/call zonder vooraf gemaakte presentatie")
-            request.headers["Authorization"] = f"{SCHEMA} {gereed}"
-            self.laatste_presentatie = gereed
+        if methode != "tools/call":
+            yield request
+            return
+        gereed, self.volgende = self.volgende, None
+        if gereed is None:
+            raise RuntimeError("tools/call zonder vooraf gemaakte presentatie")
+        request.headers["Authorization"] = f"{SCHEMA} {gereed}"
+        self.laatste_presentatie = gereed
+        self.laatste_weigering = None
         antwoord = yield request
         if antwoord.status_code in (401, 403):
             self.laatste_weigering = antwoord.headers.get("www-authenticate", "")

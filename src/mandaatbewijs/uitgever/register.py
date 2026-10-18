@@ -1,7 +1,10 @@
 """Mandaatregister van de uitgever (SQLite): verzoeken, mandaten, blokkadelijst en statuslijst.
 
 Elke toestandsovergang gebeurt in één `BEGIN IMMEDIATE`-transactie, zodat gelijktijdige verzoeken
-(twee keer ophalen, toestemming na noodstop) nooit allebei slagen.
+(twee keer ophalen, toestemming na noodstop) nooit allebei slagen. Het auditevent van een overgang
+gaat in dezelfde transactie naar de tabel `audit_uitgaand` (transactionele outbox): een uitgifte,
+ophaling, intrekking of noodstop bestaat dus nooit zonder haar auditevent. De dienst schrijft de
+outbox daarna in volgorde naar de hashketen (`Dienst.verwerk_uitgaand`).
 """
 
 from __future__ import annotations
@@ -54,16 +57,27 @@ CREATE TABLE IF NOT EXISTS statuslijst (
     token TEXT,
     getekend INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS audit_uitgaand (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    velden TEXT NOT NULL
+);
 """
 
 
 class RegisterFout(Exception):
-    """Een toestandsovergang die niet mag; `status` is de HTTP-status voor de API."""
+    """Een toestandsovergang die niet mag; `status` is de HTTP-status voor de API.
 
-    def __init__(self, reden: str, status: int = 409) -> None:
+    Attributes:
+        vastleggen: True als de weigering zelf een overgang is (een verlopen verzoek wordt
+            `verlopen`, een geblokkeerde sleutel maakt het verzoek `geweigerd`). De transactie
+            commit dan de overgang en haar auditevent voordat de fout de aanroeper bereikt.
+    """
+
+    def __init__(self, reden: str, status: int = 409, *, vastleggen: bool = False) -> None:
         super().__init__(reden)
         self.reden = reden
         self.status = status
+        self.vastleggen = vastleggen
 
 
 @dataclass(frozen=True)
@@ -102,7 +116,14 @@ class Verzoek:
         )
 
     def openbaar(self) -> dict[str, Any]:
-        """Inhoud voor het toestemmingsscherm en de API (zonder credential)."""
+        """Inhoud voor het toestemmingsscherm en de API (zonder credential).
+
+        Een ingediend of goedgekeurd verzoek voorbij `verloopt` heet hier `verlopen`, ook als
+        niemand het daarna nog aanraakte (de opslag legt die overgang pas bij een poging vast).
+        """
+        status = self.status
+        if status in ("ingediend", "goedgekeurd") and self.verloopt < int(time.time()):
+            status = "verlopen"
         return {
             "id": self.id,
             "medewerker": self.medewerker,
@@ -110,7 +131,7 @@ class Verzoek:
             "doel": self.doel,
             "acties": self.acties,
             "dossiers": self.dossiers,
-            "status": self.status,
+            "status": status,
             "verloopt": self.verloopt,
             "mandaat_id": self.mandaat_id,
         }
@@ -141,14 +162,38 @@ class Register:
 
     @contextmanager
     def _transactie(self) -> Generator[sqlite3.Connection]:
+        """`BEGIN IMMEDIATE` tot `COMMIT`; bij een fout `ROLLBACK`, behalve `vastleggen`."""
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             try:
                 yield db
+            except RegisterFout as fout:
+                db.execute("COMMIT" if fout.vastleggen else "ROLLBACK")
+                raise
             except BaseException:
-                db.execute("ROLLBACK")
+                if db.in_transaction:
+                    db.execute("ROLLBACK")
                 raise
             db.execute("COMMIT")
+
+    @staticmethod
+    def _leg_vast(db: sqlite3.Connection, **velden: Any) -> None:
+        """Zet een auditevent in de outbox, binnen de lopende transactie."""
+        db.execute(
+            "INSERT INTO audit_uitgaand (velden) VALUES (?)",
+            (json.dumps(velden, ensure_ascii=False),),
+        )
+
+    def uitgaand(self) -> list[tuple[int, dict[str, Any]]]:
+        """Vastgelegde auditevents die nog niet in het JSONL-log staan, in volgorde."""
+        with self._db() as db:
+            rijen = db.execute("SELECT id, velden FROM audit_uitgaand ORDER BY id").fetchall()
+        return [(int(r["id"]), json.loads(r["velden"])) for r in rijen]
+
+    def verwijder_uitgaand(self, nr: int) -> None:
+        """Verwijder een event uit de outbox nadat het in het JSONL-log staat."""
+        with self._db() as db:
+            db.execute("DELETE FROM audit_uitgaand WHERE id = ?", (nr,))
 
     # Verzoeken ---------------------------------------------------------------------------------
 
@@ -174,6 +219,13 @@ class Register:
                     nu + VERZOEK_GELDIG_S,
                 ),
             )
+            self._leg_vast(
+                db,
+                gebeurtenis="verzoek",
+                verzoek=verzoek_id,
+                medewerker=velden["medewerker"],
+                jkt=jkt,
+            )
         return self.verzoek(verzoek_id)
 
     def verzoek(self, verzoek_id: str) -> Verzoek:
@@ -184,11 +236,23 @@ class Register:
             raise RegisterFout("verzoek_onbekend", 404)
         return Verzoek.uit_rij(rij)
 
-    def weiger(self, verzoek_id: str, medewerker: str) -> Verzoek:
-        """De medewerker zegt nee."""
+    def weiger(self, verzoek_id: str, medewerker: str, reden: str | None = None) -> Verzoek:
+        """De medewerker zegt nee, of (met `reden`) kan het gevraagde niet verlenen."""
         with self._transactie() as db:
             v = self._ingediend(db, verzoek_id, medewerker)
             db.execute("UPDATE verzoeken SET status = 'geweigerd' WHERE id = ?", (v.id,))
+            if reden is None:
+                self._leg_vast(
+                    db, gebeurtenis="toestemming_geweigerd", verzoek=v.id, medewerker=medewerker
+                )
+            else:
+                self._leg_vast(
+                    db,
+                    gebeurtenis="toestemming_onmogelijk",
+                    verzoek=v.id,
+                    medewerker=medewerker,
+                    reden=reden,
+                )
         return self.verzoek(verzoek_id)
 
     def keur_goed(self, verzoek_id: str, medewerker: str, maak_credential: Any) -> Verzoek:
@@ -203,7 +267,14 @@ class Register:
             v = self._ingediend(db, verzoek_id, medewerker)
             if db.execute("SELECT 1 FROM blokkade WHERE jkt = ?", (v.jkt,)).fetchone():
                 db.execute("UPDATE verzoeken SET status = 'geweigerd' WHERE id = ?", (v.id,))
-                raise RegisterFout("sleutel_geblokkeerd", 403)
+                self._leg_vast(
+                    db,
+                    gebeurtenis="toestemming_geweigerd",
+                    verzoek=v.id,
+                    medewerker=medewerker,
+                    reden="sleutel_geblokkeerd",
+                )
+                raise RegisterFout("sleutel_geblokkeerd", 403, vastleggen=True)
             idx = self._vrije_idx(db)
             mandaat_id = f"m-{secrets.token_urlsafe(9)}"
             credential, iat, exp = maak_credential(v, mandaat_id, idx)
@@ -215,6 +286,18 @@ class Register:
                 "UPDATE verzoeken SET status = 'goedgekeurd', mandaat_id = ?, credential = ? "
                 "WHERE id = ?",
                 (mandaat_id, credential, v.id),
+            )
+            self._leg_vast(
+                db,
+                gebeurtenis="uitgegeven",
+                verzoek=v.id,
+                mandaat=mandaat_id,
+                medewerker=medewerker,
+                jkt=v.jkt,
+                doel=v.doel,
+                acties=v.acties,
+                dossiers=v.dossiers,
+                geldigheid_s=exp - iat,
             )
         return self.verzoek(verzoek_id)
 
@@ -236,13 +319,18 @@ class Register:
             if db.execute("SELECT 1 FROM blokkade WHERE jkt = ?", (jkt,)).fetchone():
                 raise RegisterFout("sleutel_geblokkeerd", 403)
             verlopen = v.verloopt < int(time.time())
-            nieuwe_status = "verlopen" if verlopen else "opgehaald"
             db.execute(
                 "UPDATE verzoeken SET status = ?, credential = NULL WHERE id = ?",
-                (nieuwe_status, v.id),
+                ("verlopen" if verlopen else "opgehaald", v.id),
             )
-        if verlopen:
-            raise RegisterFout("verzoek_verlopen", 410)
+            if verlopen:
+                self._leg_vast(
+                    db, gebeurtenis="ophalen_geweigerd", verzoek=v.id, reden="verzoek_verlopen"
+                )
+                raise RegisterFout("verzoek_verlopen", 410, vastleggen=True)
+            self._leg_vast(
+                db, gebeurtenis="opgehaald", verzoek=v.id, mandaat=v.mandaat_id, jkt=v.jkt
+            )
         return v.credential
 
     def _ingediend(self, db: sqlite3.Connection, verzoek_id: str, medewerker: str) -> Verzoek:
@@ -256,7 +344,14 @@ class Register:
             raise RegisterFout(f"verzoek_al_afgehandeld:{v.status}", 409)
         if v.verloopt < int(time.time()):
             db.execute("UPDATE verzoeken SET status = 'verlopen' WHERE id = ?", (v.id,))
-            raise RegisterFout("verzoek_verlopen", 410)
+            self._leg_vast(
+                db,
+                gebeurtenis="toestemming_geweigerd",
+                verzoek=v.id,
+                medewerker=medewerker,
+                reden="verzoek_verlopen",
+            )
+            raise RegisterFout("verzoek_verlopen", 410, vastleggen=True)
         return v
 
     @staticmethod
@@ -270,7 +365,12 @@ class Register:
     # Mandaten ----------------------------------------------------------------------------------
 
     def mandaten(self, medewerker: str | None = None) -> list[dict[str, Any]]:
-        """Mandaten, eventueel van één medewerker."""
+        """Mandaten, eventueel van één medewerker.
+
+        `status` is `actief`, `ingetrokken` of `verlopen`: een actief mandaat waarvan `exp`
+        voorbij is (RFC 7519 §4.1.4), heet verlopen. De statuslijst kent alleen ingetrokken.
+        """
+        nu = int(time.time())
         with self._db() as db:
             if medewerker is None:
                 rijen = db.execute("SELECT * FROM mandaten ORDER BY iat").fetchall()
@@ -278,9 +378,15 @@ class Register:
                 rijen = db.execute(
                     "SELECT * FROM mandaten WHERE medewerker = ? ORDER BY iat", (medewerker,)
                 ).fetchall()
-        return [dict(r) for r in rijen]
+        mandaten = [dict(r) for r in rijen]
+        for m in mandaten:
+            if m["status"] == "actief" and m["exp"] <= nu:
+                m["status"] = "verlopen"
+        return mandaten
 
-    def trek_in(self, mandaat_id: str, medewerker: str | None) -> dict[str, Any]:
+    def trek_in(
+        self, mandaat_id: str, medewerker: str | None, reden: str | None = None
+    ) -> dict[str, Any]:
         """Zet het mandaat op ingetrokken en de bit op INVALID; `medewerker` None is beheer."""
         with self._transactie() as db:
             rij = db.execute("SELECT * FROM mandaten WHERE id = ?", (mandaat_id,)).fetchone()
@@ -291,9 +397,18 @@ class Register:
             if rij["status"] != "actief":
                 raise RegisterFout("mandaat_al_ingetrokken", 409)
             self._zet_ingetrokken(db, [rij["idx"]], [mandaat_id])
+            velden = {"reden": reden} if reden else {}
+            self._leg_vast(
+                db,
+                gebeurtenis="ingetrokken",
+                mandaat=mandaat_id,
+                medewerker=medewerker,
+                idx=rij["idx"],
+                **velden,
+            )
             return dict(db.execute("SELECT * FROM mandaten WHERE id = ?", (mandaat_id,)).fetchone())
 
-    def noodstop(self, jkt: str) -> list[str]:
+    def noodstop(self, jkt: str, beheerder: str) -> list[str]:
         """Blokkeer een agentsleutel en trek alle actieve mandaten op die sleutel in."""
         nu = int(time.time())
         with self._transactie() as db:
@@ -306,8 +421,12 @@ class Register:
                 "AND status IN ('ingediend', 'goedgekeurd')",
                 (jkt,),
             )
-            self._zet_ingetrokken(db, [r["idx"] for r in rijen], [r["id"] for r in rijen])
-            return [r["id"] for r in rijen]
+            ingetrokken = [r["id"] for r in rijen]
+            self._zet_ingetrokken(db, [r["idx"] for r in rijen], ingetrokken)
+            self._leg_vast(
+                db, gebeurtenis="noodstop", beheerder=beheerder, jkt=jkt, mandaten=ingetrokken
+            )
+            return ingetrokken
 
     def _zet_ingetrokken(self, db: sqlite3.Connection, idxs: list[int], ids: list[str]) -> None:
         nu = int(time.time())
@@ -347,24 +466,45 @@ class Register:
     def statustoken(self, maak_token: Any, max_leeftijd_s: int) -> str:
         """Het getekende Status List Token; opnieuw getekend als het ouder is dan `max_leeftijd_s`.
 
-        Elk nieuw token krijgt een `iat` die strikt groter is dan die van het vorige, ook als een
-        intrekking in dezelfde seconde valt als de vorige ondertekening. Zo kan een verifier een
-        ouder token altijd herkennen en zijn twee tokens met dezelfde `iat` altijd gelijk van
-        inhoud.
+        `iat` is altijd de echte tijd van ondertekening (Token Status List §5.1), zodat `exp`
+        nooit verder weg ligt dan `geldig_s`. Twee tokens met dezelfde `iat` hebben altijd
+        dezelfde inhoud: is de lijst gewijzigd in de seconde waarin al getekend is, dan wacht deze
+        aanroep (buiten de transactie) tot de volgende seconde. Een verifier herkent zo een ouder
+        token aan een kleinere `iat`. Loopt de klok meer dan een seconde terug ten opzichte van de
+        laatste ondertekening, dan weigert het register (`klok_loopt_achter`, 503) in plaats van
+        een token te tekenen dat ouder lijkt dan zijn voorganger.
 
         Args:
             maak_token: `(lijst, iat) -> token`.
             max_leeftijd_s: Leeftijd waarna een nieuw token wordt getekend (de `ttl`).
+
+        Raises:
+            RegisterFout: `klok_loopt_achter` als de klok achter de laatste ondertekening ligt,
+                `statuslijst_bezet` als de lijst vijf seconden achter elkaar in de seconde van de
+                laatste ondertekening opnieuw wijzigde.
         """
+        for _ in range(5):
+            token, wacht_tot = self._teken_status(maak_token, max_leeftijd_s)
+            if token is not None:
+                return token
+            wacht = wacht_tot - time.time()
+            if wacht > 1:
+                raise RegisterFout("klok_loopt_achter", 503)
+            time.sleep(max(0.0, wacht))
+        raise RegisterFout("statuslijst_bezet", 503)
+
+    def _teken_status(self, maak_token: Any, max_leeftijd_s: int) -> tuple[str | None, int]:
+        """(token, 0), of (None, moment) als pas vanaf `moment` getekend mag worden."""
         nu = int(time.time())
         with self._transactie() as db:
             rij = db.execute("SELECT inhoud, token, getekend FROM statuslijst").fetchone()
             if rij["token"] is not None and rij["getekend"] + max_leeftijd_s > nu:
-                return rij["token"]
-            iat = max(nu, rij["getekend"] + 1)
-            token = maak_token(Statuslijst(1, bytearray(rij["inhoud"])), iat)
-            db.execute("UPDATE statuslijst SET token = ?, getekend = ? WHERE id = 1", (token, iat))
-            return token
+                return rij["token"], 0
+            if rij["getekend"] >= nu:
+                return None, rij["getekend"] + 1
+            token = maak_token(Statuslijst(1, bytearray(rij["inhoud"])), nu)
+            db.execute("UPDATE statuslijst SET token = ?, getekend = ? WHERE id = 1", (token, nu))
+            return token, 0
 
 
 __all__ = ["GELDIG", "INGETROKKEN", "Register", "RegisterFout", "Verzoek"]

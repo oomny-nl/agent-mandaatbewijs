@@ -85,10 +85,10 @@ def deterministische_planner(berichten: Sequence[AnyMessage]) -> AIMessage:
         stappen = _gekaapte_stappen(dossier, gedaan)
         if stappen:
             return AIMessage(content="", tool_calls=stappen)
-    geweigerd = [f"{r.name} ({r.content})" for r in resultaten if r.status == "error"]
+    mislukt = [f"{r.name} ({r.content})" for r in resultaten if r.status == "error"]
     samenvatting = f"Klaar met dossier {dossier}."
-    if geweigerd:
-        samenvatting += " Geweigerd: " + "; ".join(geweigerd)
+    if mislukt:
+        samenvatting += " Niet gelukt: " + "; ".join(mislukt)
     return AIMessage(content=samenvatting)
 
 

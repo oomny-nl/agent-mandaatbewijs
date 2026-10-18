@@ -18,9 +18,10 @@ en logt elke beslissing. De agent is een LangGraph-agent die zijn tools via MCP 
 
 Het is het tweede antwoord op dezelfde vraag als [`agent-mandaat`](https://github.com/oomny-nl/agent-mandaat).
 Daar geeft één Keycloak binnen één organisatie per toolactie een token uit en vraagt de API live
-of het nog actief is. Hier draagt de agent het mandaat zelf mee en heeft de verifier geen account
-bij de gemeente en geen live afhankelijkheid: alleen een vertrouwenslijst en twee gecachete
-publieke bestanden.
+of het nog actief is. Hier draagt de agent het mandaat zelf mee. De verifier heeft geen account bij de gemeente en
+vraagt niet per aanroep na of het mandaat nog geldt: hij werkt met een vertrouwenslijst en
+gecachete publieke bestanden van de gemeente (sleutels en statuslijst). Alleen een lege of
+verlopen cache leidt tot een ophaalactie.
 
 Het uitgangspunt is hetzelfde: het model mag gekaapt worden. De grens ligt in de credential en in
 de verifier, niet in de prompt. In de demo leest de agent een dossier met een ingevoegde instructie
@@ -32,17 +33,24 @@ De opname toont `make demo`: zes scenario's tegen de echte keten en daarna de au
 
 ## Zelf draaien
 
-Nodig: Docker en `make`. Alles draait lokaal, zonder API-sleutels en zonder kosten.
+Nodig: Docker en `make`; voor `make test` en `make lint` ook [uv](https://docs.astral.sh/uv/).
+Alles draait lokaal, zonder API-sleutels en zonder kosten.
 
 ```bash
 make demo
 ```
 
 Dat start de uitgever (gemeente Lindevoort) en het inkomensregister (verifier) met Compose,
-genereert de sleutels en wachtwoorden in volumes en speelt zes scenario's af. Daarna volgt de
-bewijstabel uit de auditlogs van beide organisaties, met de controle van beide hashketens. Wijkt een
-uitkomst af van het ontwerp, dan stopt de demo met een foutstatus. `make integratie` draait de
-integratietests tegen dezelfde keten, `make test` de unittests, `make lint` ruff en ty.
+genereert de uitgeverssleutel en de wachtwoorden van de fictieve medewerkers in volumes en speelt
+zes scenario's af; de agent maakt zijn sleutelpaar in het geheugen. Daarna volgt de bewijstabel uit
+de auditlogs van beide organisaties: beide hashketens moeten intact zijn en elk log moet de records
+bevatten die de scenario's horen op te leveren. Wijkt een uitkomst af van het ontwerp, dan stopt de
+demo met een foutstatus. `make integratie` draait de integratietests tegen dezelfde keten,
+`make test` de unittests, `make lint` ruff en ty.
+
+`make demo`, `make integratie` en `make down` wissen de Docker-volumes (`docker compose down -v`):
+sleutels, wachtwoorden, registerdata en auditlogs van een vorige run zijn daarna weg. Elke run
+begint dus schoon.
 
 Met een echt taalmodel in plaats van de deterministische planner: zet in `.env` `PLANNER=llm` en
 de variabelen voor Azure OpenAI of een OpenAI-compatibele endpoint (zie `.env.example`), en draai
@@ -65,8 +73,10 @@ deterministische planner.
    Dezelfde credential met een verse nonce maar getekend met de sleutel van een dief:
    `kb_handtekening_ongeldig`.
 4. **Ingetrokken.** Sanne trekt haar mandaat in. De gemeente zet een bit in de statuslijst. Het
-   register, dat de lijst elke vijf seconden ververst, weigert de volgende aanroep binnen die vijf
-   seconden: `mandaat_ingetrokken`. De demo toont beide tijdstippen.
+   register gebruikt een gecachete statuslijst hoogstens `ttl` seconden (in de demo 5) na het begin
+   van de download en weigert daarna: `mandaat_ingetrokken`. De demo roept elke seconde aan, toont
+   na hoeveel seconden de eerste weigering en de laatste toelating vielen, en faalt als een aanroep
+   die `ttl` seconden of later na de intrekking begon, nog is toegelaten.
 5. **Uitgever niet vertrouwd.** Gemeente Elsweerd geeft een correct getekend mandaat uit aan
    dezelfde agent. Het register weigert: `uitgever_niet_vertrouwd`, zonder iets bij Elsweerd op te
    halen.
@@ -99,8 +109,8 @@ sequenceDiagram
     end
     S->>U: DELETE /mandaten/id
     U->>U: bit in de statuslijst
-    R->>U: GET /statuslijsten/1 (elke ttl seconden, op eigen klok)
-    Note over R: volgende aanroep: mandaat_ingetrokken
+    R->>U: GET /statuslijsten/1 (op de achtergrond, of bij een verlopen cache)
+    Note over R: aanroepen vanaf ttl seconden na de intrekking: mandaat_ingetrokken
 ```
 
 ### Wat er in het mandaat staat
@@ -111,9 +121,9 @@ sequenceDiagram
 | `cnf.jwk` | nee | Publieke sleutel van de agent (key binding) |
 | `status.status_list` | nee | Index en URI van de statuslijst van de gemeente |
 | `doel` | ja | Waarvoor de agent handelt |
-| `acties` | per element | `inkomen:lezen`, eventueel `inkomen:corrigeren` |
+| `acties` | per element | `inkomen:lezen`; geen rol in de demo mag `inkomen:corrigeren` mandateren |
 | `dossiers` | per element | Dossiernummers uit Sannes caseload |
-| `medewerker`, `afdeling` | ja | Wie het mandaat gaf; het register krijgt dit nooit te zien |
+| `medewerker`, `afdeling` | ja | Wie het mandaat gaf; het register vraagt dit niet en de agent in deze repo toont het niet |
 
 De gemeente geeft alleen uit wat de medewerker zelf mag: het dossier moet in haar caseload zitten
 en haar rol moet de actie toestaan. De agent krijgt dus nooit meer rechten dan de mens.
@@ -133,19 +143,39 @@ weigering komt in het auditrecord:
 5. De key-binding JWT is getekend met de sleutel uit `cnf`, heeft dit register als `aud`, is vers
    en draagt een nonce die dit register heeft uitgegeven. De nonce wordt op dat moment verbruikt,
    in één databasetransactie, ook bij gelijktijdige verzoeken.
-6. De statuslijst van de gemeente zegt dat het mandaat geldig is. Het register ververst de lijst
-   op een eigen klok; een presentatie veroorzaakt alleen een ophaalactie als de cache leeg of
-   verlopen is. Is de gemeente onbereikbaar, dan overbrugt een geldige cache tot `exp` van het
-   Status List Token; daarna geldt nee. Een ontvangen maar ongeldig token maakt de cache onbruikbaar.
+6. De statuslijst van de gemeente zegt dat het mandaat geldig is. Het register gebruikt een
+   gecachete lijst hoogstens `ttl` seconden na het begin van haar download en nooit na `exp` van
+   het token. Een achtergrondtaak ververst de lijsten (in Compose elke 5 seconden), zodat een
+   presentatie meestal geen ophaalactie veroorzaakt. Is de gemeente onbereikbaar, dan overbrugt een
+   geldige cache tot `exp` van het Status List Token; daarna geldt nee. Een ontvangen maar ongeldig
+   token maakt de cache onbruikbaar.
 7. Het mandaat dekt de aanroep: de actie van de tool staat in de bekendgemaakte acties, het
    dossier in de bekendgemaakte dossiers, en het doel is een doel dat het register voor deze tool
    accepteert.
-8. Auditrecord: tijd, uitgever, mandaat-id, sleutel-thumbprint, tool, actie, dossier, bekendgemaakte
-   claimnamen, beslissing, reden en bron van de statusinformatie.
+8. Auditrecord van elke beslissing: tijd, tool, dossier, beslissing en reden. Een toelating
+   noemt ook uitgever, mandaat-id, sleutel-thumbprint, doel, actie, de bekendgemaakte claimnamen
+   en de bron van de statusinformatie (`vers`, `cache` of `cache-verouderd`).
 
-Beide organisaties schrijven een hashketen. De gemeente logt verzoek, toestemming, uitgifte,
-intrekking en noodstop; het register elke toelating en elke weigering. De demo sorteert beide op
-tijd en controleert de ketens.
+Voor intrekking betekent stap 6: zolang het register de gemeente kan bereiken, wordt elke aanroep
+die `ttl` seconden of later na de intrekking begint, geweigerd. Een aanroep die eerder begint, kan
+nog door. Kan het register de gemeente niet bereiken, dan schuift die grens op tot `exp` van het
+laatst opgehaalde token (in de demo 60 seconden na de ondertekening).
+
+Een weigering legt vast wat op dat moment vaststond. Kloppen de handtekeningen van uitgever en
+agent, dan staan `iss`, `jti`, thumbprint en de bekendgemaakte claimnamen als bevestigde velden in
+het record (weigering op het mandaatprofiel, de nonce, de status of het bereik); bij
+`mandaat_ingetrokken` komt de statusbron erbij, bij een bereikweigering de actie. Een eerdere
+weigering (geen of een misvormde presentatie, onbekende uitgever, ongeldige handtekening van
+uitgever of agent) heeft geen mandaat-id; een `iss` uit een nog niet geverifieerd token staat dan
+in het record, gemarkeerd als `onbevestigd`. Ook een te groot verzoek en een niet toegestane
+JSON-RPC-methode krijgen een record. Headers, presentaties en bodies worden nooit gelogd.
+
+Beide organisaties schrijven een hashketen. De gemeente logt verzoeken, toestemming (en daarmee de
+uitgifte) of weigering, ophalen, intrekking en noodstop, plus geweigerde logins, ophalingen en
+beheerhandelingen. Elke toestandsovergang en haar auditevent gaan in één databasetransactie
+(transactionele outbox): een uitgifte of intrekking zonder auditevent bestaat niet. Het register
+logt elke toelating en elke weigering. De demo sorteert beide logs op tijd, controleert de ketens
+en eist per scenario de verwachte records, met het mandaat-id waar dat vaststaat.
 
 ## Bewijs
 
@@ -161,7 +191,7 @@ Elke bewering hierboven heeft een test die faalt als de maatregel wegvalt. Een s
 | Presentatie voor een ander register | geweigerd | `aud` onjuist | `test_kb_met_verkeerde_aud` (u) |
 | Extra of weggelaten disclosure na het tekenen | geweigerd | `sd_hash` klopt niet | `test_disclosure_toegevoegd_na_tekenen_breekt_sd_hash` (u) |
 | Disclosure die `cnf` of `status` selectief maakt | geweigerd | beschermde claim | `test_selectieve_subclaim_in_beschermde_claim_wordt_geweigerd` (u) |
-| Mandaat ingetrokken | geweigerd binnen `ttl` | statuslijst | `test_ingetrokken_via_statuslijst_binnen_ttl` (i) |
+| Mandaat ingetrokken | geweigerd voor elke aanroep vanaf `ttl` na de intrekking | statuslijst | `test_ingetrokken_geen_toegang_meer_na_ttl` (i) |
 | Gemeente onbereikbaar, cache geldig | toegestaan uit cache tot `exp` | overbrugging | `test_statuscache_overbrugt_netwerkfout_maar_niet_ongeldig_token` (u) |
 | Gemeente onbereikbaar, geen cache | geweigerd | status onbekend | `test_geen_cache_en_onbereikbaar_is_status_onbekend` (u) |
 | Mandaat van gemeente Elsweerd | geweigerd zonder netwerkverkeer | uitgever niet vertrouwd | `test_uitgever_niet_vertrouwd_zonder_netwerk` (u) |
@@ -169,6 +199,8 @@ Elke bewering hierboven heeft een test die faalt als de maatregel wegvalt. Een s
 | Agentsleutel geblokkeerd | mandaat ingetrokken, nieuw verzoek geweigerd | noodstop | `test_noodstop_blokkeert_sleutel` (i) |
 | Bram (intake) mandateert inkomen lezen | uitgifte geweigerd | bevoegdheid ontbreekt | `test_bevoegdheid_van_de_medewerker_begrenst_het_mandaat` (u) |
 | Auditrecord gewijzigd of weggelaten | keten breekt | hashketen | `test_gewijzigd_record_breekt_de_keten` (u) |
+| Auditlog ontbreekt, is leeg of mist een verwacht record | demo faalt | bewijs onvolledig | `test_controleer_log_eist_bestaand_gevuld_en_volledig_log` (u) |
+| MCP-protocolfout of toolfout bij het register | agent meldt een fout, geen weigering | eigen soort | `test_toolknoop_onderscheidt_weigering_protocolfout_en_toolfout` (u) |
 
 (u) `tests/unit/`, (i) `tests/integratie/`. Het volledige overzicht per OWASP-risico staat in
 [docs/DREIGINGSMODEL.md](docs/DREIGINGSMODEL.md); de keuzes, de standaarden en de verhouding tot
@@ -195,11 +227,18 @@ de EUDI-wallet en de NL GOV-profielen in [docs/ONTWERP.md](docs/ONTWERP.md).
   statuslijst doorwerkt. In productie hoort die sleutel in een HSM, TPM of key vault.
 - Wie de uitgeverssleutel heeft, kan elk mandaat en elke statuslijst vervalsen. Herstel vereist het
   beëindigen van het vertrouwen in die sleutel; de demo roteert hem niet.
-- Intrekken werkt bij de volgende verversing van de statuslijst, niet onmiddellijk. `ttl` is de knop.
+- Intrekken werkt niet onmiddellijk: een aanroep die binnen `ttl` seconden na de intrekking
+  begint, kan nog door, en bij een onbereikbare gemeente schuift die grens op tot `exp` van het
+  gecachete statustoken. `ttl` en de geldigheid van het token zijn de knoppen.
 - Alle presentaties van één mandaat zijn aan elkaar te koppelen (zelfde `jti` en sleutel). Dat is
   hier bedoeld, maar een verschil met burgercredentials.
 - Binnen zijn mandaat kan het model onzin produceren, en gegevens die het legitiem leest kunnen in
   zijn uitvoer terechtkomen. Dataminimalisatie en outputcontrole staan hier los van.
+- De agent kiest zelf welke claims hij toont. Het register eist wat het nodig heeft, maar weigert
+  een presentatie niet omdat zij meer bekendmaakt (bijvoorbeeld `medewerker`).
+- Het register toetst alleen zijn eigen tools. De lokale tool `dossier_lezen` leest het
+  gemeentedossier zonder credential; autorisatie op de eigen dossiers van de gemeente valt buiten
+  wat deze repo aantoont.
 - De vertrouwenslijst is een lokaal bestand. In productie is dat een beheerd vertrouwensregister.
 - De adrescontrole vóór de verbinding en de verbinding zelf zijn twee DNS-opzoekingen; DNS
   rebinding valt buiten deze demo.
@@ -216,7 +255,7 @@ de EUDI-wallet en de NL GOV-profielen in [docs/ONTWERP.md](docs/ONTWERP.md).
 | `src/mandaatbewijs/houder/` | De agent: sleutelpaar, credential, presentatie per aanroep, MCP-verbinding, planner, LangGraph |
 | `src/mandaatbewijs/verifier/` | Inkomensregister: MCP-tools achter een poort, vertrouwenslijst, JWKS- en statuscache, nonces, audit |
 | `src/mandaatbewijs/demo.py` | Regie van de zes scenario's en de bewijstabel |
-| `tests/` | 140 unittests, 14 integratietests tegen de echte keten |
+| `tests/` | 261 unittests, 14 integratietests tegen de echte keten |
 | `docs/` | Ontwerp en dreigingsmodel |
 
 Kwaliteit: `ruff`, `ty`, `pytest`, de compose-keten en gitleaks in CI. Versies zijn exact gepind:

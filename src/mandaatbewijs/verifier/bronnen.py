@@ -1,16 +1,18 @@
 """Publieke bronnen van een uitgever, veilig opgehaald en gecachet: metadata, JWKS, statuslijst.
 
 Ophalen (ONTWERP §7): dezelfde oorsprong als `iss`, `https` tenzij `STA_HTTP_TOE=1`, adrescontrole
-vóór de verbinding, geen redirects, hoogstens 64 KiB en 5 seconden voor naamresolutie en
-download samen.
+vóór de verbinding, geen redirects, hoogstens 64 KiB (na eventuele decompressie) en 5 seconden
+voor naamresolutie en download samen.
 
-Statuscache (ONTWERP §7): bruikbaar zolang `opgehaald + ttl > nu` én `nu < exp`; bij een netwerkfout
-overbrugging tot `exp`; een ontvangen maar ongeldig token maakt de cache onbruikbaar tot een
-geldige verversing. Gelijktijdige verversingen van dezelfde lijst worden geserialiseerd. Het
-token met de hoogste `iat` blijft bewaard, ook als de cache onbruikbaar is: een ouder token
+Statuscache (ONTWERP §7), per combinatie van uitgever en lijst-URI: bruikbaar zolang
+`opgehaald + ttl > nu` én `nu < exp`, met `opgehaald` het begin van de download; bij een
+netwerkfout overbrugging tot `exp`; een ontvangen maar ongeldig token, of elke onverwachte fout bij
+het verwerken ervan, maakt de cache onbruikbaar tot een geldige verversing. Gelijktijdige
+verversingen van dezelfde lijst worden geserialiseerd en delen de uitkomst, geslaagd of mislukt.
+Het token met de hoogste `iat` blijft bewaard, ook als de cache onbruikbaar is: een ouder token
 vervangt het nooit en bevestigt het ook niet (het telt als mislukte verversing), en een ander
 token met dezelfde `iat` maar een andere lijst maakt de cache onbruikbaar. Een achtergrondtaak
-ververst elke bekende lijst elke `ttl` seconden.
+houdt de bekende lijsten warm; de grens voor een beslissing komt uit de cacheregel hierboven.
 """
 
 from __future__ import annotations
@@ -28,7 +30,8 @@ import httpx2
 from joserfc.errors import JoseError
 from joserfc.jwk import ECKey
 
-from mandaatbewijs.sleutels import publieke_sleutel
+from mandaatbewijs.sdjwt import metadata_url
+from mandaatbewijs.sleutels import jose_kop, publieke_sleutel
 from mandaatbewijs.statuslijst import MEDIATYPE, StatuslijstFout, Statustoken, lees_token
 from mandaatbewijs.verifier.vertrouwenslijst import Uitgever
 
@@ -36,6 +39,8 @@ MAX_ANTWOORD = 64 * 1024
 TIMEOUT_S = 5.0
 JWKS_CACHE_S = 300
 JWKS_HERHAAL_S = 10
+# Deze headers beschrijven de ontvangen bytes, niet de gedecodeerde inhoud uit `_download`.
+TRANSPORTHEADERS = frozenset({"content-encoding", "content-length", "transfer-encoding"})
 
 # Alleen deze netwerken mogen in de demo (`STA_HTTP_TOE=1`) voor een host op de vertrouwenslijst:
 # RFC 1918, ULA en loopback (lokaal draaien zonder Docker). Link-local (zoals 169.254.169.254),
@@ -57,6 +62,7 @@ class BronFout(Exception):
         super().__init__(f"{reden}: {detail}" if detail else reden)
         self.reden = reden
         self.klasse = klasse
+        self.detail = detail
 
 
 def _zelfde_oorsprong(a: str, b: str) -> bool:
@@ -135,7 +141,13 @@ class Ophaler:
             raise BronFout("netwerkfout", "netwerk", f"{url}: {fout}") from fout
 
     async def _download(self, url: str, accept: str) -> httpx2.Response:
-        async with self.client.stream("GET", url, headers={"Accept": accept}) as antwoord:
+        """Download met grens op de gedecodeerde inhoud; het antwoord bevat de gedecodeerde bytes.
+
+        Vraagt geen compressie aan. Comprimeert een tussenliggende proxy toch, dan decodeert
+        `aiter_bytes` en vervallen de transportheaders, zodat niets twee keer wordt gedecodeerd.
+        """
+        kop = {"Accept": accept, "Accept-Encoding": "identity"}
+        async with self.client.stream("GET", url, headers=kop) as antwoord:
             if antwoord.status_code != 200:
                 raise BronFout("http_status", "netwerk", f"{url} gaf {antwoord.status_code}")
             inhoud = bytearray()
@@ -143,18 +155,52 @@ class Ophaler:
                 inhoud.extend(deel)
                 if len(inhoud) > MAX_ANTWOORD:
                     raise BronFout("antwoord_te_groot", "ongeldig", url)
+            headers = [
+                (k, v)
+                for k, v in antwoord.headers.multi_items()
+                if k.lower() not in TRANSPORTHEADERS
+            ]
             return httpx2.Response(
-                200, content=bytes(inhoud), headers=antwoord.headers, request=antwoord.request
+                200, content=bytes(inhoud), headers=headers, request=antwoord.request
             )
 
+    async def sluit(self) -> None:
+        """Sluit de HTTP-client (bij het afsluiten van de app)."""
+        await self.client.aclose()
 
-def _max_age(antwoord: httpx2.Response, standaard: int) -> int | None:
-    """Cacheduur uit `Cache-Control`; None bij `no-store`."""
-    cc = antwoord.headers.get("cache-control", "")
-    if "no-store" in cc:
+
+def _cacheduur(antwoord: httpx2.Response, standaard: int) -> int:
+    """Hoe lang een antwoord bewaard mag worden, in seconden (RFC 9111); 0 is niet bewaren.
+
+    Richtlijnen zijn hoofdletterongevoelig en mogen een gequote waarde hebben (`max-age="5"`).
+    `no-store` en `no-cache` geven 0: deze cache hervalideert niet, dus elke keer opnieuw ophalen.
+    Een ongeldige of dubbele `max-age` of een ongeldige `Age` geeft ook 0 (RFC 9111 §4.2.1: dan
+    als verouderd behandelen). Een geldige `Age` gaat van `max-age` af; hoogstens `standaard`.
+    """
+    richtlijnen: dict[str, list[str]] = {}
+    for deel in antwoord.headers.get_list("cache-control", split_commas=True):
+        naam, _, waarde = deel.partition("=")
+        waarde = waarde.strip()
+        if len(waarde) >= 2 and waarde[0] == waarde[-1] == '"':
+            waarde = waarde[1:-1]
+        richtlijnen.setdefault(naam.strip().lower(), []).append(waarde)
+    if "no-store" in richtlijnen or "no-cache" in richtlijnen:
+        return 0
+    max_age = richtlijnen.get("max-age")
+    if max_age is None:
+        return standaard
+    duur = _delta_seconden(max_age[0]) if len(max_age) == 1 else None
+    leeftijd = _delta_seconden(antwoord.headers.get("age", "0").strip())
+    if duur is None or leeftijd is None:
+        return 0
+    return max(0, min(standaard, duur - leeftijd))
+
+
+def _delta_seconden(waarde: str) -> int | None:
+    """`delta-seconds` (RFC 9111 §1.2.2): None als ongeldig; te grote waarden worden 2^31."""
+    if not re.fullmatch(r"[0-9]+", waarde):
         return None
-    gevonden = re.search(r"max-age=(\d+)", cc)
-    return min(standaard, int(gevonden.group(1))) if gevonden else standaard
+    return int(waarde) if len(waarde) <= 10 else 2**31
 
 
 def _json(antwoord: httpx2.Response, reden: str) -> Any:
@@ -208,7 +254,7 @@ class Sleutelbron:
 
     async def _ververs(self, uitgever: Uitgever, cache: JwksCache) -> dict[str, ECKey]:
         """Haal de sleutels op; bewaar ze alleen als het antwoord caching toestaat."""
-        meta_url = f"{uitgever.iss}/.well-known/jwt-vc-issuer"
+        meta_url = metadata_url(uitgever.iss)
         antwoord = await self.ophaler.haal(meta_url, uitgever.iss, "application/json")
         meta = _json(antwoord, "uitgever_metadata_onjuist")
         if not isinstance(meta, dict) or meta.get("issuer") != uitgever.iss:
@@ -216,11 +262,11 @@ class Sleutelbron:
         if "jwks" in meta and "jwks_uri" in meta:
             raise BronFout("uitgever_metadata_onjuist", "ongeldig", "jwks én jwks_uri aanwezig")
         if "jwks" in meta:
-            jwks, duur = meta["jwks"], _max_age(antwoord, JWKS_CACHE_S)
+            jwks, duur = meta["jwks"], _cacheduur(antwoord, JWKS_CACHE_S)
         else:
             jwks_uri = str(meta.get("jwks_uri", ""))
             antwoord = await self.ophaler.haal(jwks_uri, uitgever.iss, "application/json")
-            jwks, duur = _json(antwoord, "jwks_ongeldig"), _max_age(antwoord, JWKS_CACHE_S)
+            jwks, duur = _json(antwoord, "jwks_ongeldig"), _cacheduur(antwoord, JWKS_CACHE_S)
         sleutels = _lees_jwks(jwks)
         # `no-store` of `max-age=0`: alleen voor deze aanvraag, niet voor volgende.
         cache.sleutels = sleutels if duur else {}
@@ -244,12 +290,19 @@ def _lees_jwks(jwks: Any) -> dict[str, ECKey]:
 
 @dataclass
 class Statuscache:
-    """Cache van één statuslijst."""
+    """Cache van één statuslijst van één uitgever.
 
+    `afgerond` telt de afgeronde ophaalpogingen en `laatste_fout` bewaart de uitkomst van de
+    laatste, zodat wie op een lopende poging wachtte die uitkomst deelt in plaats van zelf opnieuw
+    te downloaden.
+    """
+
+    uitgever: Uitgever
     token: Statustoken | None = None
     opgehaald: float = 0.0
     onbruikbaar: bool = False
-    uitgever: Uitgever | None = None
+    afgerond: int = 0
+    laatste_fout: BronFout | None = None
     slot: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -262,17 +315,16 @@ class Statusuitkomst:
 
 
 class Statusbron:
-    """Statuslijsten per URI, met de cacheregels uit ONTWERP §7."""
+    """Statuslijsten per uitgever en URI, met de cacheregels uit ONTWERP §7."""
 
     def __init__(self, ophaler: Ophaler, sleutelbron: Sleutelbron) -> None:
         self.ophaler = ophaler
         self.sleutelbron = sleutelbron
-        self._caches: dict[str, Statuscache] = {}
+        # Per (iss, uri): een lijst wordt alleen gebruikt voor de uitgever die hem ondertekende.
+        self._caches: dict[tuple[str, str], Statuscache] = {}
 
-    @property
-    def bekende_uris(self) -> list[str]:
-        """URI's die ooit zijn opgevraagd (voor de achtergrondverversing)."""
-        return list(self._caches)
+    def _cache(self, uri: str, uitgever: Uitgever) -> Statuscache:
+        return self._caches.setdefault((uitgever.iss, uri), Statuscache(uitgever))
 
     def _bruikbaar(self, cache: Statuscache, nu: float) -> bool:
         t = cache.token
@@ -283,30 +335,50 @@ class Statusbron:
     async def ververs(self, uri: str, uitgever: Uitgever) -> None:
         """Haal de lijst op; een ongeldig token maakt de cache onbruikbaar, een netwerkfout niet.
 
-        Gelijktijdige verversingen van dezelfde URI wachten op elkaar; wie na het wachten een
-        zojuist ververste, bruikbare cache aantreft, haalt niet opnieuw op.
+        Gelijktijdige verversingen van dezelfde lijst wachten op elkaar. Wie wachtte terwijl een
+        andere aanvraag ophaalde, krijgt die uitkomst: dezelfde fout, of bij een geslaagde poging
+        de bruikbare cache. Zo leidt een storing niet tot een rij downloads achter elkaar.
         """
-        cache = self._caches.setdefault(uri, Statuscache())
-        cache.uitgever = uitgever
+        cache = self._cache(uri, uitgever)
         self.ophaler.controleer_url(uri, uitgever.iss)
-        begin = time.time()
+        gezien = cache.afgerond
         async with cache.slot:
-            if cache.opgehaald >= begin and self._bruikbaar(cache, time.time()):
-                return
+            if cache.afgerond != gezien:
+                fout = cache.laatste_fout
+                if fout is not None:
+                    raise BronFout(fout.reden, fout.klasse, fout.detail)
+                if self._bruikbaar(cache, time.time()):
+                    return
+            cache.laatste_fout = None  # een afgebroken poging laat geen oude fout achter
             try:
-                antwoord = await self.ophaler.haal(uri, uitgever.iss, MEDIATYPE)
-                mediatype = antwoord.headers.get("content-type", "")
-                if not mediatype.startswith(MEDIATYPE):
-                    raise BronFout("mediatype_onjuist", "netwerk", mediatype)
-                token = await self._lees(antwoord.text, uitgever, uri)
+                await self._haal_en_lees(cache, uri, uitgever)
             except BronFout as fout:
-                if fout.klasse == "ongeldig":
-                    cache.onbruikbaar = True
+                cache.laatste_fout = fout
                 raise
-            self._vergelijk_met_cache(cache, token)
-            cache.token, cache.opgehaald, cache.onbruikbaar = token, time.time(), False
+            finally:
+                cache.afgerond += 1
 
-    @staticmethod
+    async def _haal_en_lees(self, cache: Statuscache, uri: str, uitgever: Uitgever) -> None:
+        begin = time.time()  # de inhoud is minstens zo vers als het begin van de download
+        try:
+            antwoord = await self.ophaler.haal(uri, uitgever.iss, MEDIATYPE)
+            mediatype = antwoord.headers.get("content-type", "")
+            if not mediatype.startswith(MEDIATYPE):
+                raise BronFout("mediatype_onjuist", "netwerk", mediatype)
+            token = await self._lees(antwoord.text, uitgever, uri)
+            self._vergelijk_met_cache(cache, token)
+        except BronFout as fout:
+            if fout.klasse == "ongeldig":
+                cache.onbruikbaar = True
+            raise
+        except Exception as fout:
+            # Een fout die hier niet voorzien is, mag een oude lijst nooit bruikbaar laten.
+            cache.onbruikbaar = True
+            raise BronFout(
+                "statusverwerking_mislukt", "ongeldig", f"{type(fout).__name__}: {fout}"
+            ) from fout
+        cache.token, cache.opgehaald, cache.onbruikbaar = token, begin, False
+
     @staticmethod
     def _vergelijk_met_cache(cache: Statuscache, token: Statustoken) -> None:
         """Weiger een token dat het gecachete token (hoogste `iat`) zou terugdraaien.
@@ -330,11 +402,9 @@ class Statusbron:
         raise BronFout("statustoken_tegenstrijdig", "ongeldig", f"twee lijsten met iat {oud.iat}")
 
     async def _lees(self, tekst: str, uitgever: Uitgever, uri: str) -> Statustoken:
-        from joserfc import jws  # noqa: PLC0415
-
         try:
-            kid = jws.extract_compact(tekst.encode()).protected.get("kid")
-        except (JoseError, ValueError) as fout:
+            kid = jose_kop(tekst).get("kid")
+        except ValueError as fout:
             raise BronFout("statustoken_ongeldig", "ongeldig", str(fout)) from fout
         if not isinstance(kid, str):
             raise BronFout("statustoken_ongeldig", "ongeldig", "geen kid")
@@ -356,7 +426,7 @@ class Statusbron:
             raise BronFout(
                 "url_andere_oorsprong", "ongeldig", f"{uri} hoort niet bij {uitgever.iss}"
             )
-        cache = self._caches.setdefault(uri, Statuscache())
+        cache = self._cache(uri, uitgever)
         if self._bruikbaar(cache, time.time()):
             return Statusuitkomst(self._lees_idx(cache, idx), "cache")
         try:
@@ -382,9 +452,7 @@ class Statusbron:
 
     async def ververs_alles(self) -> None:
         """Achtergrondverversing van alle bekende lijsten; fouten blijven in de cachetoestand."""
-        for uri, cache in list(self._caches.items()):
-            if cache.uitgever is None:
-                continue
+        for (_, uri), cache in list(self._caches.items()):
             try:
                 await self.ververs(uri, cache.uitgever)
             except BronFout:
