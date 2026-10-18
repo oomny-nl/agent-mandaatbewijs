@@ -1,7 +1,6 @@
 # Ontwerp: een agentmandaat als verifieerbare credential over organisatiegrenzen heen
 
-Status: vastgesteld 17-10-2026 (versie 3, na drie reviewrondes). Repo: `agent-mandaatbewijs`.
-Titel README: "Een agentmandaat als verifieerbare credential over organisatiegrenzen heen".
+Ontwerp van 17-10-2026, bijgewerkt 18-10-2026. Repo: `agent-mandaatbewijs`.
 
 "Mandaat" is in deze repo een technische werkterm: de afgebakende bevoegdheid die een medewerker
 aan een agent geeft, vastgelegd in een door de organisatie ondertekende credential. Het is geen
@@ -79,13 +78,13 @@ de draadformaten wijzigen.
 
 ### Keuze van de implementatie
 
-Vereiste uit de opdracht: kies tussen een eigen Python-implementatie van SD-JWT op basis van een
-bestaande, onderhouden library, en een bestaande SD-JWT-library. Gecontroleerd op 17-10-2026:
+Twee wegen lagen open: een eigen Python-implementatie van SD-JWT op een bestaande, onderhouden
+JOSE-library, of een bestaande SD-JWT-library. Gecontroleerd op 17-10-2026:
 
 | Kandidaat | Stand | Oordeel |
 |---|---|---|
 | `sd-jwt` 0.10.4 (openwallet-foundation-labs/sd-jwt-python) | Laatste release op PyPI 16-02-2024; GitHub laatste push 17-08-2026; "reference implementation", afhankelijk van `jwcrypto` en `pyyaml` | Nuttig als referentie, maar niet als afhankelijkheid: ruim tweeënhalf jaar geen release op PyPI (releaseleeftijd alleen bewijst geen gebrekkig onderhoud, maar de gepinde versie volgt een oudere draft), geen SD-JWT VC-profiel, geen statuslijst, en `pyyaml` als extra afhankelijkheid |
-| `token-status-list` 0.1.0a2 | Alpha, december 2024 | Niet onderhouden genoeg |
+| `token-status-list` 0.1.0a2.dev1 | Ontwikkelversie van een alpha, december 2024 | Niet onderhouden genoeg |
 | `joserfc` 1.7.5 (authlib) | Release 29-08-2026; JWS, JWK, thumbprint, ES256; alleen `cryptography` als afhankelijkheid | Gekozen als JOSE-laag |
 | `jwcrypto` 1.6.1 | Onderhouden, breder API | Niet nodig naast `joserfc` |
 
@@ -110,7 +109,8 @@ intrekkingsmechanisme (eis VCR_11a), vraagt een willekeurige index per credentia
 en cachen (VCR_15). Dit bewijsstuk gebruikt dezelfde bouwstenen voor een ander soort houder (een
 agent namens een medewerker in plaats van een burger) en sluit gedeeltelijk op die eisen aan:
 VCR_11a en VCR_17 volledig; VCR_15 doordat de verifier de statuslijst op een eigen klok ververst
-(elke `ttl`) en een presentatie alleen bij een lege of verlopen cache een ophaalactie veroorzaakt.
+(elke `STATUS_VERVERS_S` seconden) en een presentatie alleen bij een lege of verlopen cache een
+ophaalactie veroorzaakt.
 In Nederland bouwt Logius aan de NL-wallet op dezelfde ARF-basis. Voor federatieve toegang tussen
 overheidsorganisaties bestaan twee aparte Logius-profielen: NL GOV Assurance profile for OAuth 2.0
 (API-autorisatie) en NL GOV Assurance profile for OpenID Connect (authenticatie). Dit bewijsstuk is
@@ -139,8 +139,8 @@ De uitgever tekent een SD-JWT VC met deze inhoud:
 }
 ```
 
-Altijd zichtbaar: uitgever, type, mandaat-id, geldigheid (in de demo één uur; de medewerker kiest
-korter), de sleutel van de agent en de verwijzing naar de statuslijst. Selectief bekend te maken:
+Altijd zichtbaar: uitgever, type, mandaat-id, geldigheid (hoogstens een uur; de medewerker kiest
+korter, in de demo tien minuten), de sleutel van de agent en de verwijzing naar de statuslijst. Selectief bekend te maken:
 
 | Claim | Inhoud | Wie krijgt hem |
 |---|---|---|
@@ -159,7 +159,10 @@ maskeren het aantal verborgen topniveauclaims maar gedeeltelijk (het aantal deco
 gepubliceerd); het aantal dossiers in het mandaat blijft zichtbaar als arraylengte. Wie het
 mandaat verleende staat in de verborgen `medewerker`-disclosure, in het register van de uitgever
 en in zijn auditlog, onder het mandaat-id. Presentaties van hetzelfde mandaat zijn onderling
-koppelbaar via de issuer-signed JWT, `jti` en `cnf.jwk`; zie §13.
+koppelbaar via de issuer-signed JWT, `jti` en `cnf.jwk`; zie §13. Welke disclosures een
+presentatie bevat, kiest de houder (RFC 9901 §4). De houder in deze repo maakt `medewerker` en
+`afdeling` nooit bekend; het register eist ze niet, maar weigert een presentatie die ze toch
+bevat ook niet.
 
 Elke disclosure krijgt een eigen, cryptografisch willekeurige salt van 128 bits
 (`secrets.token_bytes(16)`, base64url-gecodeerd tot de string die de disclosure vereist;
@@ -186,7 +189,7 @@ Volgorde (de demo speelt alle rollen; de uitgever is een FastAPI-dienst):
    het is de inhoud van het toestemmingsscherm.
 2. De medewerker ziet het verzoek in haar werkplek als **toestemmingsscherm**: "De dossierassistent
    (sleutel 7f3e…) wil namens u, voor aanvraag levensonderhoud, inkomensgegevens opvragen voor de
-   dossiers 2026-0142 en 2026-0143, één uur lang. [Ja] [Nee]". Zij geeft toestemming met haar eigen
+   dossiers 2026-0142 en 2026-0143, tien minuten lang. [Ja] [Nee]". Zij geeft toestemming met haar eigen
    authenticatie bij de uitgever (in de demo HTTP Basic met een lokaal gegenereerd wachtwoord; in
    productie de reguliere login van de werkplek).
 3. De uitgever controleert dat de medewerker deze bevoegdheid zelf heeft (dossiers in haar caseload,
@@ -238,8 +241,8 @@ Uitgever-endpoints:
 
 ## 6. Presentatie: per toolaanroep alleen wat nodig is
 
-De agent is een LangGraph-agent met twee lokale tools (dossier lezen en een notitie zetten in het
-eigen gemeentedossier, in-process) en twee MCP-tools bij het inkomensregister:
+De agent is een LangGraph-agent met één lokale tool (`dossier_lezen`: het eigen gemeentedossier
+lezen, in-process en zonder credential) en twee MCP-tools bij het inkomensregister:
 `inkomen_opvragen(dossier)` (actie `inkomen:lezen`) en `correctie_indienen(dossier, tekst)` (actie
 `inkomen:corrigeren`). De toolmetadata van de MCP-server vermeldt per tool de actie en de claims die
 de verifier nodig heeft; de agent leest dat uit `tools/list`.
@@ -259,7 +262,8 @@ Per `tools/call`:
 4. HTTP: `Authorization: Mandaat <jwt>~<d1>~…~<dn>~<kb-jwt>` op het MCP-verzoek. `Mandaat` is een
    eigen HTTP-authenticatieschema voor deze demo; er bestaat geen gestandaardiseerd schema voor
    SD-JWT+KB in een HTTP-header. Een weigering geeft `401` of `403` met
-   `WWW-Authenticate: Mandaat error="…", error_description="…"` en bij `401` een verse `nonce`.
+   `WWW-Authenticate: Mandaat error="…", nonce_url="…"`; voor een nieuwe poging haalt de agent
+   daar een verse nonce op.
 
 De poort voor de MCP-server werkt met een vaste allowlist van JSON-RPC-methoden die zonder
 presentatie mogen: `initialize`, `notifications/initialized`, `ping`, `tools/list` en de
@@ -277,6 +281,11 @@ van `iss`), alle disclosures tegen de digests, `iss` gelijk aan de uitgever waar
 indiende, tijdvenster, en `cnf.jwk` gelijk aan zijn eigen sleutel. Een vervalste of aan een
 andere sleutel gebonden credential komt niet in de portemonnee (`PortemonneeFout`).
 
+Een weigering van de poort (`401` of `403` met `WWW-Authenticate` voor dezelfde aanroep) komt als
+weigering met reden in het toolbericht aan het model. Een MCP-protocolfout of een toolfout van het
+register heet in het toolbericht en in de demo ook zo, zodat een storing nooit als
+beveiligingsweigering wordt gepresenteerd.
+
 ## 7. Verificatie bij het inkomensregister
 
 De verifier heeft drie bronnen, alle publiek en gecachet:
@@ -285,15 +294,27 @@ De verifier heeft drie bronnen, alle publiek en gecachet:
   `iss`-waarde, de toegestane `vct`-waarden en een naam. Een uitgever die er niet op staat, wordt
   geweigerd vóór er iets wordt opgehaald: de verifier haalt nooit sleutels op van een onbekende
   uitgever.
-- **JWKS** per uitgever, via `/.well-known/jwt-vc-issuer` → `jwks_uri`. De metadata telt alleen
+- **JWKS** per uitgever, via `/.well-known/jwt-vc-issuer` → `jwks_uri`. Het well-known-pad staat
+  vóór het pad van `iss` (SD-JWT VC §4): voor `iss` `https://host/gemeente/x` is de metadata-URL
+  `https://host/.well-known/jwt-vc-issuer/gemeente/x`. De metadata telt alleen
   als `issuer` daarin exact gelijk is aan de `iss` van de credential (SD-JWT VC §4.3); anders
   wordt zij genegeerd en de presentatie geweigerd (`uitgever_metadata_onjuist`). `jwks_uri` moet
   dezelfde oorsprong (schema, host, poort) hebben als `iss`; redirects worden niet gevolgd;
-  antwoorden zijn begrensd op 64 KiB en 5 seconden; de JWKS moet een object met een `keys`-lijst
-  van publieke EC-sleutels zijn. Cache 300 seconden, of korter als de uitgever een lagere
-  `Cache-Control: max-age` stuurt (ook voor een `jwks` die inline in de metadata staat); met
-  `no-store` (of `max-age=0`) geldt de opgehaalde JWKS alleen voor de aanvraag die haar ophaalde
-  en wordt niets bewaard. Metadata met zowel `jwks` als `jwks_uri` is onjuist. Alleen een sleutel
+  antwoorden zijn begrensd op 64 KiB (na decompressie) en 5 seconden; de JWKS moet een object met
+  een `keys`-lijst van publieke EC-sleutels met `kid` zijn, en een sleutel waarvan `use`, `alg` of
+  `key_ops` niet bij ES256-verificatie past, maakt de JWKS ongeldig (RFC 7517 §4.2 tot en met
+  4.4). Cache 300 seconden, of korter volgens `Cache-Control` en `Age` (RFC 9111: richtlijnen zijn
+  hoofdletterongevoelig, `max-age` mag gequote zijn, en `no-store` en `no-cache` geven nul omdat
+  deze cache niet hervalideert), ook voor een `jwks` die inline in de metadata staat. De grens is
+  het begin van de ophaalactie plus die duur min de ouderdom van het antwoord (RFC 9111 §4.2.3: zo
+  tellen de tijd in een tussenliggende HTTP-cache en de transporttijd mee, zonder op de klok van
+  de uitgever te leunen). De ouderdom is `Age` plus één seconde, want `Age` telt hele seconden en
+  een cache rondt naar beneden af (gemeten met Varnish 7.7: na 0,99 s nog `Age: 0`); zonder `Age`
+  is ze nul. Een ongeldige of dubbele `Age` geeft nul; dat is eigen beleid, strenger dan RFC 9111
+  §5.1, die de eerste waarde neemt en een ongeldige negeert. Bij `jwks_uri` geldt de kortste grens
+  van metadata en JWKS. Bij nul, of als de grens bij aankomst al voorbij is, geldt de opgehaalde
+  JWKS alleen voor de aanvraag die haar ophaalde en wordt niets bewaard. Metadata met zowel `jwks`
+  als `jwks_uri` is onjuist. Alleen een sleutel
   uit een nog geldige cache of uit een zojuist geslaagde ophaalactie is bruikbaar. De verifier
   haalt per uitgever hoogstens eens per 10 seconden op, ook als de cache leeg of verlopen is, en
   gelijktijdige aanvragen wachten op die ene ophaalactie. Binnen die 10 seconden wordt
@@ -301,8 +322,9 @@ De verifier heeft drie bronnen, alle publiek en gecachet:
   lege of verlopen cache met `jwks_niet_beschikbaar` (een netwerkfout, voor de statuscache dus
   overbrugbaar); een verlopen sleutel komt na een mislukte verversing nooit terug. Een uitgever
   die steeds faalt, kost dus hoogstens één download per 10 s.
-- **Statuslijst** per `uri`, als Status List Token; dezelfde oorsprong als `iss`, dezelfde
-  grenzen voor redirects, omvang en tijd. Zie hieronder voor caching.
+- **Statuslijst** per uitgever en `uri`, als Status List Token (twee uitgevers op dezelfde
+  oorsprong delen geen cache); dezelfde oorsprong als `iss`, dezelfde grenzen voor redirects,
+  omvang en tijd. Zie hieronder voor caching.
 
 Alle ophaal-URL's moeten `https` zijn; met `STA_HTTP_TOE=1` (Compose) is `http` toegestaan, maar
 alleen naar oorsprongen die als `iss` op de vertrouwenslijst staan. Omdat `jwks_uri` en de
@@ -331,14 +353,19 @@ nooit door bij twijfel:
    `kid` wijst naar een sleutel in de JWKS van die uitgever, de handtekening klopt, `_sd_alg` is
    `sha-256`.
 4. De disclosures, volgens RFC 9901 §7.1 (volledig):
-   - elke disclosure is een base64url-gecodeerde JSON-lijst van twee (`[salt, waarde]`) of drie
-     (`[salt, naam, waarde]`) elementen, met een string als salt en als naam; anders ongeldig;
+   - de presentatie bestaat uit US-ASCII-tekens; elke disclosure is canonieke base64url zonder
+     padding (RFC 9901 §4 via RFC 7515 §2) en gedecodeerd een JSON-lijst van twee
+     (`[salt, waarde]`) of drie (`[salt, naam, waarde]`) elementen, met een string als salt en
+     als naam; anders ongeldig;
    - de payload wordt recursief verwerkt: in elk object wordt elke digest uit `_sd` opgezocht, in
      elke lijst elk element van de vorm `{"...": digest}`;
    - een digest die meer dan eens in de payload voorkomt, maakt de presentatie ongeldig, **ook als
      er geen disclosure voor is meegestuurd**;
    - een disclosure met claimnaam in een `...`-positie, of zonder claimnaam in `_sd`, is ongeldig;
-   - claimnamen `_sd` en `...` en een claimnaam die al in het object staat, zijn ongeldig;
+   - claimnamen `_sd`, `_sd_alg` en `...` en een claimnaam die al in het object staat, zijn
+     ongeldig (gecontroleerd tegen de oorspronkelijke namen, vóór het verwijderen);
+   - `_sd_alg` staat alleen op het hoogste niveau, en `...` alleen als enige sleutel van een
+     array-element; elders is de presentatie ongeldig;
    - een disclosure die bij geen enkele digest hoort, maakt de presentatie ongeldig;
    - `_sd`, `_sd_alg` en niet-opgeloste `...`-elementen (decoys) worden uit de verwerkte payload
      verwijderd;
@@ -346,17 +373,22 @@ nooit door bij twijfel:
      niet selectief zijn, **inclusief hun subclaims** (SD-JWT VC §2.2.2.3): een `_sd`-lid of een
      `...`-element ergens binnen die subtrees (bijvoorbeeld `x` in `cnf.jwk` of `idx` in
      `status.status_list`) maakt de presentatie ongeldig, net als een topniveaudisclosure met zo'n
-     naam. Dit mandaatprofiel verbiedt daarnaast disclosure van `iat` en `jti` (de draft staat
-     `iat` toe); `aka_vcts` wordt niet ondersteund en daarom ook als beschermd behandeld.
+     naam. Dit mandaatprofiel verbiedt daarnaast disclosure van `iat`, `jti` en `aud` (de draft
+     staat `iat` toe; een verborgen `aud` zou de houder laten kiezen of de verifier haar te zien
+     krijgt); `aka_vcts` wordt niet ondersteund en daarom ook als beschermd behandeld.
    Daarna wordt de **verwerkte** payload gecontroleerd: `nbf` en `exp` zijn gehele getallen en
    kloppen met 30 seconden klokmarge; `cnf.jwk` is een publieke P-256-sleutel zonder privélid;
-   `status.status_list.idx` is een niet-negatief geheel getal en `uri` een string.
+   `status.status_list.idx` is een niet-negatief geheel getal en `uri` een string; een aanwezige
+   `aud` (string of lijst) noemt deze verifier (RFC 7519 §4.1.3).
 5. De KB-JWT: `typ` is `kb+jwt`, `alg` ES256, getekend met `cnf.jwk`; `aud` is exact (als string)
    de identifier van deze verifier; `iat` is een geheel getal binnen 60 seconden van nu;
    `sd_hash` is gelijk aan de hash over de ontvangen bytes van JWT en disclosures; de `nonce` is
-   een string, door deze verifier uitgegeven en niet verlopen. De nonce wordt op dit punt, na een
-   geldige KB-handtekening, in één `BEGIN IMMEDIATE`-transactie verbruikt (eenmalig, ook bij
-   gelijktijdige verzoeken). Een latere weigering (stap 6 of 7) maakt de nonce niet opnieuw
+   een string, door deze verifier uitgegeven en niet verlopen. Dan toetst de verifier het
+   mandaatprofiel: `jti` is een niet-lege string, `iat` en `nbf` zijn gehele getallen, `acties` en
+   `dossiers` zijn lijsten van strings en `doel` is, als het bekend is gemaakt, een string; anders
+   `profiel_ongeldig`. De nonce wordt op dit punt, na een geldige KB-handtekening en een geldig
+   profiel, in één `BEGIN IMMEDIATE`-transactie verbruikt (eenmalig, ook bij gelijktijdige
+   verzoeken). Een latere weigering (stap 6 of 7) maakt de nonce niet opnieuw
    bruikbaar: de agent moet een nieuwe nonce vragen.
 6. De status: `status.status_list.uri` heeft dezelfde oorsprong als `iss`; het Status List Token is
    getekend door dezelfde uitgever (JWKS), `typ` is `statuslist+jwt`, `alg` ES256; de claims
@@ -368,8 +400,9 @@ nooit door bij twijfel:
    gevraagde dossier in de bekendgemaakte `dossiers`, en `doel` is een doel dat het register voor
    deze tool accepteert (lokaal beleid van de verifier: `aanvraag-levensonderhoud` voor
    `inkomen:lezen`; `inkomen:corrigeren` accepteert in deze demo geen enkel doel van een agent).
-8. Auditrecord: tijd, uitgever, mandaat-id, sleutel-thumbprint, tool, actie, dossier, de
-   bekendgemaakte claimnamen, beslissing, reden, bron van de statusinformatie.
+8. Auditrecord: tijd, tool, dossier, beslissing en reden; bij een toelating ook uitgever,
+   mandaat-id, sleutel-thumbprint, doel, actie, de bekendgemaakte claimnamen en de bron van de
+   statusinformatie. Wat een weigering vastlegt, staat in §9.
 
 De verifier bewaart geen credential en geen persoonsgegevens van de medewerker: die krijgt hij niet.
 
@@ -379,12 +412,18 @@ Het Status List Token draagt `iat`, `exp` en `ttl` (statuslijst-draft §5.1). De
 demo `ttl` op 5 seconden en `exp` op `iat + 60`; de instellingen `STATUSLIJST_TTL` en
 `STATUSLIJST_GELDIG` sturen dat. De verifier:
 
-- ververst elke bekende statuslijst op een eigen klok, elke `ttl` seconden, los van het
-  presentatiemoment (ARF VCR_15); een presentatie veroorzaakt alleen een ophaalactie als er geen
-  bruikbare cache is;
+- ververst elke bekende statuslijst op een eigen klok, `STATUS_VERVERS_S` seconden (in Compose 5)
+  na afloop van de vorige ronde, los van het presentatiemoment (ARF VCR_15); een presentatie
+  veroorzaakt alleen een ophaalactie als er geen bruikbare cache is;
 - gebruikt een gecachete lijst alleen als **beide** gelden: `opgehaald + ttl > nu` **en**
-  `nu < exp` van het gecachete token. Een token dat op seconde 59 is opgehaald met `exp = 60` en
-  `ttl = 5` is op seconde 62 dus onbruikbaar, ook al is de `ttl` niet om;
+  `nu < exp` van het gecachete token, met `opgehaald` het begin van de download min de ouderdom
+  van het antwoord (`Age` plus één seconde, zie de JWKS hierboven; RFC 9111 §4.2.3: een trage
+  download of een tussenliggende HTTP-cache verlengt de cache dus niet). Een token dat op seconde
+  59 is opgehaald met `exp = 60` en `ttl = 5` is op seconde 62 dus onbruikbaar, ook al is de `ttl`
+  niet om. Een ongeldige of dubbele `Age` telt als oneindig oud (eigen beleid, strenger dan RFC
+  9111 §5.1). Een token dat bij aankomst al ouder is dan `ttl`, wordt wel bewaard (het kan een
+  intrekking bevatten), maar telt als mislukte verversing: hoogstens overbrugging tot `exp`, nooit
+  `vers`. Hetzelfde token opnieuw met meer `Age` verkort de cache niet;
 - haalt anders een nieuwe op. Lukt dat **niet** door een netwerk- of HTTP-fout (geen antwoord,
   time-out, status ≠ 200, verkeerd mediatype), dan geldt: is het gecachete token nog niet voorbij
   zijn eigen `exp`, dan wordt het gebruikt en krijgt het auditrecord `status_bron:
@@ -399,27 +438,61 @@ demo `ttl` op 5 seconden en `exp` op `iat + 60`; de instellingen `STATUSLIJST_TT
   mislukte statusvalidatie afwijzing voor als SHOULD; de overbrugging bij netwerkfouten is de
   bewuste, door de uitgever met `exp` begrensde afwijking daarop, ten gunste van beschikbaarheid;
 - verlengt bij geen enkele mislukte verversing het ophaaltijdstip of de `exp` van de cache;
-- serialiseert gelijktijdige verversingen van dezelfde lijst (één download, de rest wacht);
+- serialiseert gelijktijdige verversingen van dezelfde lijst: één download, de rest wacht en
+  deelt de uitkomst, ook een mislukte. Een antwoord dat aankwam maar te oud was
+  (`statusantwoord_verouderd`, `statustoken_verouderd`), geldt alleen voor wie vóór het begin van
+  die download aanvroeg; wie later aanvroeg, haalt zelf op (zie het gevolg voor intrekking);
 - bewaart het token met de hoogste `iat`, ook wanneer de cache onbruikbaar is. Een binnengekomen
   token met een oudere `iat` vervangt het niet en bevestigt het ook niet: het telt als mislukte
   verversing (netwerkfout, dus hoogstens overbrugging tot `exp` van het gecachete token), zodat een
   vertraagde of teruggespeelde download een intrekking nooit terugdraait en een verlopen cache
   nooit als vers geldt. Hetzelfde token opnieuw (zelfde `iat`, zelfde lijst) bevestigt een
   bruikbare cache maar herstelt een onbruikbare niet. Een token met dezelfde `iat` maar een
-  andere lijst is tegenstrijdig en maakt de cache onbruikbaar; daarvoor zorgt de uitgever dat
-  de `iat` van opeenvolgende tokens strikt stijgt (zie onder). Een token is op het moment `exp`
+  andere lijst is tegenstrijdig en maakt de cache onbruikbaar; daarom laat de uitgever de
+  `iat` van opeenvolgende tokens strikt stijgen (zie onder). Een token is op het moment `exp`
   zelf al verlopen.
 
-Gevolg voor intrekking: een intrekking bij de uitgever werkt bij de verifier uiterlijk `ttl`
-seconden later (bij een geslaagde verversing), en bij een onbereikbare uitgever uiterlijk bij
-`exp`. De demo laat de tijdstempels zien: intrekking om T, weigering om T + hoogstens ttl.
+Gevolg voor intrekking (intrekking om T): zolang de verifier de uitgever kan bereiken, wordt elke
+aanroep die om T + `ttl` of later begint, geweigerd. Een cache die vóór T is opgehaald, is dan
+verlopen, en een download die na T begint, krijgt een token met de nieuwe bit, want na een
+intrekking tekent de uitgever altijd opnieuw. Dat geldt ook met een HTTP-cache tussen verifier en
+uitgever die zich aan RFC 9111 houdt en bij een opgeslagen antwoord `Age` meestuurt: de verifier
+telt die ouderdom mee, met één seconde extra voor de afronding. Elke cache in een keten rondt af,
+dus achter n caches kan de werkelijke ouderdom tot n seconden boven `Age` liggen; de garantie geldt
+voor één cache. Een cache die een opgeslagen antwoord zonder `Age` levert (in strijd met RFC 9111
+§4), kan het venster met zijn eigen bewaartijd verlengen, bij `max-age=ttl` tot T + 2 × `ttl` en
+nooit voorbij `exp`; dat valt buiten deze garantie. Een cache die een verlopen antwoord levert
+(Varnish-grace, standaard 10 seconden, of `stale-while-revalidate`), stuurt een token dat bij
+aankomst al ouder is dan `ttl`. De verifier behandelt dat als een mislukte verversing: voor die
+aanroep schuift de grens, net als bij een onbereikbare uitgever, op tot `exp`. Wie de grens van
+T + `ttl` wil houden, zet grace voor de statuslijst op nul (de demo slaagt achter Varnish 7.7 met
+`default_grace=0` en faalt met de standaard van 10 seconden). Door de afrondingsseconde en de
+transporttijd kan bij `max-age` gelijk aan `ttl` ook een niet-verlopen antwoord (tot
+`Age: ttl - 1`) bij aankomst als te oud tellen; het auditrecord meldt dan `cache-verouderd`.
+Toelating met de oude status kan dan alleen via een download die vóór T + `ttl` begon: een cache
+zonder grace die de `max-age` van de uitgever volgt, levert vanaf T + `ttl` alleen antwoorden die
+na T zijn opgeslagen. Een later begonnen download kan hetzelfde label krijgen, maar draagt dan de
+intrekking en wordt geweigerd. Wie op een eerder begonnen download wachtte maar pas na het begin
+ervan aanvroeg, deelt die uitkomst niet en haalt zelf op.
+Zo ziet ook een aanroep die precies op T + `ttl` begint terwijl een eerdere download nog loopt,
+de intrekking. Een aanroep die eerder begint, kan nog worden toegelaten; de achtergrondverversing
+maakt dat venster in de praktijk korter, maar de grens volgt uit de cacheregel en niet uit die
+klok. Antwoordt de uitgever niet of met een fout, dan schuift de
+grens op tot de `exp` van het gecachete token (in de demo `iat` + 60). Een aanroep die al is
+toegelaten, loopt door. De demo roept na de intrekking elke seconde aan, de integratietest elke
+kwart seconde; beide falen als een aanroep die om T + `ttl` of later begon, nog is toegelaten. De
+demo toont na hoeveel seconden de eerste weigering en de laatste toelating vielen.
 
-De uitgever tekent het Status List Token opnieuw bij elke intrekking of noodstop, en daarnaast
-bij elke `GET /statuslijsten/1` waarbij het laatst getekende token ouder is dan `ttl`. Zo verloopt
-een ongewijzigde lijst nooit bij een verifier die ververst, en blijft `exp` toch kort. Elk nieuw
-token krijgt een `iat` die strikt groter is dan die van het vorige, ook als een intrekking in
-dezelfde seconde valt als de vorige ondertekening; twee tokens met dezelfde `iat` hebben dus altijd
-dezelfde lijst.
+Een intrekking of noodstop wist bij de uitgever het getekende token; de eerstvolgende
+`GET /statuslijsten/1` tekent een nieuw token met de bijgewerkte lijst. Daarnaast tekent een GET
+opnieuw als het laatst getekende token `ttl` seconden of ouder is. Zo verloopt een ongewijzigde
+lijst nooit bij een verifier die ververst, en blijft `exp` toch kort. `iat` is altijd de echte tijd
+van ondertekening (statuslijst-draft §5.1), dus `exp` ligt nooit verder dan `STATUSLIJST_GELDIG`
+na het werkelijke moment. Is de lijst gewijzigd in de seconde waarin al getekend is, dan wacht de
+GET tot de volgende seconde: elk nieuw token heeft een strikt grotere `iat` dan het vorige, en twee
+tokens met dezelfde `iat` hebben altijd dezelfde lijst. Loopt de klok van de uitgever meer dan een
+seconde terug, dan weigert hij (`503 klok_loopt_achter`) in plaats van een token te tekenen dat
+ouder lijkt dan zijn voorganger.
 
 ### Replay en nonce
 
@@ -440,14 +513,16 @@ dat binnen Compose); zie §13.
 ## 8. Intrekking en noodstop
 
 - **Intrekken door de medewerker**: `DELETE /mandaten/{id}`. De uitgever zet de bit op `idx` op
-  `1` (INVALID), tekent direct een nieuw Status List Token en logt. De verifier weigert zodra zijn
-  cache ververst (zie boven).
+  `1` (INVALID), wist het getekende Status List Token zodat de volgende ophaling een nieuw token
+  tekent, en legt het auditevent in dezelfde transactie vast. De verifier weigert elke aanroep die
+  `ttl` seconden of later na de intrekking begint (zie boven).
 - **Noodstop door de beheerder**: `POST /noodstop` met de thumbprint van de agentsleutel. De
   uitgever zet alle mandaten op die sleutel op INVALID en zet de thumbprint op een blokkadelijst:
   een nieuw mandaatverzoek met die sleutel wordt geweigerd. De agent moet een nieuw sleutelpaar
   maken en opnieuw om toestemming vragen (rotatie). Een gekaapte agentsleutel is daarmee bij
-  verifiers die deze statuslijst volgen en succesvol verversen binnen `ttl` onbruikbaar; bij een
-  verifier die de uitgever niet kan bereiken uiterlijk bij `exp` van zijn gecachete token. Een
+  verifiers die deze statuslijst volgen en de uitgever kunnen bereiken, onbruikbaar voor elke
+  aanroep die `ttl` seconden of later na de noodstop begint; bij een verifier die de uitgever niet
+  kan bereiken uiterlijk bij `exp` van zijn gecachete token. Een
   aanroep die vóór de verversing al is toegelaten, loopt door. De blokkade betreft een sleutel
   (thumbprint), geen proces: een aanvaller met een ander sleutelpaar kan opnieuw om toestemming
   vragen, en loopt dan tegen de medewerker aan. Zie "Wat dit niet oplost".
@@ -462,9 +537,22 @@ schaalkwestie van productie (VCR_18).
 
 Beide organisaties schrijven een eigen auditlog: append-only JSONL met een hashketen (elk record
 draagt de hash van het vorige), in een eigen Docker-volume. De uitgever logt verzoeken, toestemming,
-weigering van toestemming, uitgifte, ophalen, intrekking en noodstop; de verifier logt elke
-`tools/call` met beslissing en reden, en elke nonce-uitgifte niet (ruis). De demo leest beide logs
-(alleen-lezen volumes), controleert beide ketens en bouwt de bewijstabel. Tamper-evident, niet
+weigering van toestemming, uitgifte, ophalen, intrekking en noodstop, plus geweigerde logins,
+ophalingen en beheerhandelingen. Elke toestandsovergang schrijft haar auditevent in dezelfde
+SQLite-transactie naar een outbox (`audit_uitgaand`); de dienst zet de outbox daarna in volgorde in
+de hashketen, ook na een herstart, zonder dubbele records. Een outboxevent houdt de tijd van de
+overgang (`tijd`) en krijgt bij het afleveren `geschreven` erbij. Een uitgifte of intrekking zonder
+auditevent bestaat dus niet. Een record telt pas mee als de volledige regel met `fsync` op schijf
+staat. Mislukt het schrijven halverwege (vol volume, I/O-fout), dan kapt het log het bestand terug
+tot vóór die regel; mislukt ook dat, dan herstelt de volgende schrijfactie het eerst. Een
+onvolledige laatste regel na een crash wordt bij de start verwijderd en als waarschuwing gelogd.
+Een half geschreven record breekt de keten dus niet, en bij de uitgever blijft het event in de
+outbox tot het volledig in het log staat. De verifier logt elke `tools/call` met beslissing en reden, en ook een
+te groot verzoek, een misvormde header en een niet toegestane methode; nonce-uitgifte logt hij niet
+(ruis). De demo leest beide logs (alleen-lezen volumes), eist dat ze bestaan en niet leeg zijn,
+controleert beide ketens, zoekt per scenario de verwachte records (gebeurtenis, reden en waar dat
+vaststaat het mandaat-id) in volgorde terug en bouwt de bewijstabel; ontbreekt er één, dan faalt de
+demo. Tamper-evident, niet
 tamper-proof: wie het bestand kan herschrijven, kan de keten herberekenen. In productie hoort het
 log in WORM-opslag.
 
@@ -477,10 +565,12 @@ Wat er in het log staat en wat niet: de verifier logt nooit de `Authorization`-h
 presentatie of ruwe disclosures, alleen de bekendgemaakte claimnamen en de waarden die voor de
 beslissing nodig waren (actie, dossier, mandaat-id, thumbprint). Gegevens uit een token dat nog
 niet of niet volledig gevalideerd is (bijvoorbeeld `iss` bij een weigering in stap 1 tot 5),
-worden gemarkeerd: het record noemt in `onbevestigd` de namen van die velden. Na een geldige
-handtekening van de uitgever (een weigering op nonce, status of bereik) draagt het record
-`iss`, `jti` en de sleutel-thumbprint als bevestigde velden, zonder die markering; zo heeft juist
-een mandaatoverschrijding altijd de correlatiesleutel `(iss, jti)`. Beperking van de hashketen:
+worden gemarkeerd: het record noemt in `onbevestigd` de namen van die velden. Na geldige
+handtekeningen van uitgever en agent (een weigering op het mandaatprofiel, de nonce, de status of
+het bereik) draagt het record `iss`, `jti`, de sleutel-thumbprint en de bekendgemaakte claimnamen
+als bevestigde velden, zonder die markering; bij `mandaat_ingetrokken` komt de statusbron erbij,
+bij een bereikweigering de actie. Zo heeft juist een mandaatoverschrijding altijd de
+correlatiesleutel `(iss, jti)`. Beperking van de hashketen:
 zonder onafhankelijk
 anker (een extern vastgelegde laatste hash) merkt de controle niet dat de **staart** van het log
 is verwijderd; wie de laatste weigeringen wist, laat een nog steeds geldige keten achter. De demo
@@ -505,9 +595,11 @@ uitkomst ontbreekt of een onverwachte toelating voorkomt.
 3. **Replay.** Een afgeluisterde presentatie uit scenario 1 wordt opnieuw aangeboden:
    `nonce_onbekend_of_gebruikt`. Dezelfde presentatie met een verse nonce maar getekend met een
    andere sleutel: `kb_handtekening_ongeldig`.
-4. **Ingetrokken.** Sanne trekt haar mandaat in. De uitgever zet de bit; de demo toont de tijd. De
-   verifier weigert de volgende aanroep (`mandaat_ingetrokken`) zodra zijn cache ververst, binnen
-   `ttl` seconden; de demo toont beide tijdstempels.
+4. **Ingetrokken.** Sanne trekt haar mandaat in. De uitgever zet de bit en de demo roept elke
+   seconde aan. De verifier weigert (`mandaat_ingetrokken`) zodra zijn cache is ververst, en in
+   elk geval elke aanroep die `ttl` seconden of later na de intrekking begint. De demo toont na
+   hoeveel seconden de eerste weigering en de laatste toelating vielen en faalt bij een toelating
+   voorbij die grens.
 5. **Uitgever niet vertrouwd.** Gemeente Elsweerd (tweede uitgever, in-process in de demo) geeft
    een geldig getekend mandaat uit aan dezelfde agent. Het register weigert:
    `uitgever_niet_vertrouwd`, zonder iets bij Elsweerd op te halen.
@@ -516,7 +608,8 @@ uitkomst ontbreekt of een onverwachte toelating voorkomt.
    geweigerd (`sleutel_geblokkeerd`). Met een nieuw sleutelpaar werkt het weer.
 
 Daarna de bewijstabel: de records van beide auditlogs op tijd gesorteerd (tijd, organisatie,
-mandaat, actie, dossier, uitkomst, reden), met de ketencontrole van beide logs.
+mandaat, actie, dossier, uitkomst, reden), met de ketencontrole van beide logs en de controle dat
+elk log de verwachte records van de scenario's bevat.
 
 Optioneel `PLANNER=llm` zoals in `agent-mandaat`: een echt model via LangChain krijgt de echte
 toolschema's; de uitkomstcontroles gelden dan niet.
@@ -573,8 +666,15 @@ KB-JWT met `alg: none` of HS256.
   `cnf.jwk`; een verifier (of twee samenwerkende verifiers) kan ze aan elkaar koppelen. Dat is hier
   bedoeld (het mandaat-id is de auditsleutel) maar is een verschil met burgercredentials, waar
   batch-uitgifte en eenmalig gebruik dat tegengaan.
-- **Intrekking is niet onmiddellijk.** De verifier merkt een intrekking pas bij de volgende
-  verversing van de statuslijst. Dat is de prijs van "geen live vraag per aanroep"; `ttl` is de knop.
+- **Intrekking is niet onmiddellijk.** Een aanroep die binnen `ttl` seconden na de intrekking
+  begint, kan nog door; bij een onbereikbare uitgever schuift die grens op tot `exp` van het
+  gecachete token. Dat is de prijs van "geen live vraag per aanroep"; `ttl` en de geldigheid van
+  het statustoken zijn de knoppen.
+- **De houder kiest de disclosures.** Het register eist wat het nodig heeft, maar weigert een
+  presentatie niet omdat zij meer claims bekendmaakt.
+- **Lokale tools.** `dossier_lezen` leest het eigen gemeentedossier zonder credential; het register
+  toetst alleen zijn eigen tools. Autorisatie op de dossiers van de gemeente zelf valt buiten wat
+  deze repo aantoont.
 - **Binnen zijn mandaat kan het model onzin produceren.** De credential begrenst wat een agent kan,
   niet of het klopt.
 - **Gegevens die de agent legitiem leest, kunnen in zijn uitvoer terechtkomen.** Dataminimalisatie
@@ -590,7 +690,8 @@ KB-JWT met `alg: none` of HS256.
   protocollen (bewijs van sleutelbezit, nonce, `aud`) maar niet de berichten; dat is bewust, om de
   essentie zichtbaar te houden.
 - **Geen herd-privacy** op de statuslijst met een handvol mandaten.
-- **De verifier vertrouwt de klok** van de uitgever en de agent binnen 30 seconden.
+- **De verifier vertrouwt de klok** van de uitgever binnen 30 seconden (`nbf` en `exp` van de
+  credential) en van de agent binnen 60 seconden (`iat` van de KB-JWT).
 - **DNS rebinding.** De adrescontrole vóór de verbinding en de verbinding zelf zijn twee
   DNS-opzoekingen; een productie-opzet pint het opgeloste adres of gebruikt een egress-proxy.
 - **Agents die andere agents mandateren** vallen buiten deze demo; de credential heeft geen
@@ -609,8 +710,14 @@ KB-JWT met `alg: none` of HS256.
   netwerkfout geeft geen overbrugging, intern adres geweigerd, nonce blijft verbruikt na latere
   weigering), de
   uitgever (caseload, rol, blokkadelijst bij toestemming én bij ophalen, onveranderlijk verzoek,
-  eenmalig ophalen, andere medewerker), de planner en de demo-controle. Integratietests tegen de
-  echte keten voor de zes scenario's, gelijktijdige replay, de cachegevallen (via een instelbaar
-  `ttl`) en de bewijstabel.
+  eenmalig ophalen, andere medewerker, atomaire outbox), de houder (weigering tegenover
+  protocol- en toolfout), de planner en de demo-controle (bestaande, gevulde en volledige logs, de
+  `ttl`-grens bij intrekking). De storings- en cachegevallen van de statuslijst staan in de
+  unittests. Integratietests tegen de echte keten voor de zes scenario's, gelijktijdige replay,
+  intrekking binnen de `ttl`-grens, de allowlist van de poort en de auditketens.
 - README NL en EN, sequence-diagram (Mermaid), bewijstabel, SECURITY.md, EUPL-1.2.
-- Geen secrets in git: sleutels en wachtwoorden worden bij de start lokaal gegenereerd in volumes.
+- Geen secrets in git: de uitgeverssleutel en de wachtwoorden worden bij de start lokaal
+  gegenereerd in volumes (bestanden met rechten 0600); de agentsleutel bestaat alleen in het
+  geheugen van het agentproces.
+- Dependabot stelt wekelijks updates voor van Python-afhankelijkheden, GitHub Actions en het
+  basisimage; de pins blijven exact.

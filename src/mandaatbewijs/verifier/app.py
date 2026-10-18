@@ -14,7 +14,6 @@ import os
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
-from typing import Any
 
 import uvicorn
 from mcp.server.mcpserver import Context, MCPServer
@@ -24,7 +23,7 @@ from starlette.responses import JSONResponse, Response
 
 from mandaatbewijs.audit import Auditlog
 from mandaatbewijs.verifier.bronnen import Ophaler, Sleutelbron, Statusbron
-from mandaatbewijs.verifier.gegevens import INKOMENS, TOOLBELEID, VERIFIER_NAAM
+from mandaatbewijs.verifier.gegevens import TOOLBELEID, VERIFIER_NAAM, inkomen
 from mandaatbewijs.verifier.nonces import NONCE_GELDIG_S, Nonces
 from mandaatbewijs.verifier.poort import Achtergrondtaak, Mandaatpoort, Poortinstellingen
 from mandaatbewijs.verifier.verificatie import Toelating, Verificatie
@@ -57,7 +56,7 @@ class Instellingen:
 
 @dataclass
 class Dienst:
-    """Gedeelde onderdelen (lui opgebouwd)."""
+    """Gedeelde onderdelen; `maak_app` bouwt ze allemaal bij de start, vóór het eerste verzoek."""
 
     inst: Instellingen
 
@@ -127,10 +126,10 @@ def maak_mcp(dienst: Dienst) -> MCPServer:
         toelating = _toelating(ctx)
         if toelating.dossier != dossier:
             raise ToolError("dossier in de aanroep wijkt af van de toegelaten aanroep")
-        inkomen = INKOMENS.get(dossier)
-        if inkomen is None:
-            raise ToolError(f"geen inkomensgegevens voor dossier {dossier}")
-        return json.dumps(inkomen, ensure_ascii=False, indent=2)
+        gegevens = inkomen(toelating.uitgever, dossier)
+        if gegevens is None:
+            raise ToolError(f"geen inkomensgegevens voor dossier {dossier} ({toelating.uitgever})")
+        return json.dumps(gegevens, ensure_ascii=False, indent=2)
 
     @mcp.tool(
         meta=TOOLBELEID["correctie_indienen"].meta,
@@ -162,7 +161,11 @@ def maak_app(dienst: Dienst, achtergrond: bool = True) -> Mandaatpoort:
     app = mcp.streamable_http_app(stateless_http=True, json_response=True, host="0.0.0.0")  # noqa: S104
     taak = Achtergrondtaak(dienst.statusbron.ververs_alles, dienst.inst.ververs_s)
     inst = Poortinstellingen(
-        dienst.verificatie, dienst.audit, dienst.nonce_url, taak if achtergrond else None
+        dienst.verificatie,
+        dienst.audit,
+        dienst.nonce_url,
+        taak if achtergrond else None,
+        afsluiten=dienst.ophaler.sluit,
     )
     return Mandaatpoort(app, inst)
 
@@ -171,10 +174,3 @@ def main() -> None:
     """Start het register (in de container op poort 8000)."""
     logging.basicConfig(level=logging.INFO)
     uvicorn.run(maak_app(Dienst(Instellingen.uit_omgeving())), host="0.0.0.0", port=8000)  # noqa: S104
-
-
-def toolbeleid_uit_meta(meta: dict[str, Any] | None) -> tuple[str, list[str]]:
-    """(actie, doelen) uit de `meta` van een tool, zoals de houder die via `tools/list` ziet."""
-    if not isinstance(meta, dict):
-        return "", []
-    return str(meta.get("actie", "")), [str(d) for d in meta.get("doelen", [])]

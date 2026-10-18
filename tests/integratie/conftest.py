@@ -9,7 +9,8 @@ from __future__ import annotations
 import json
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -75,7 +76,14 @@ Verlener = Callable[..., Mandaat]
 
 
 @pytest.fixture
-def verleen(omgeving: Omgeving) -> Verlener:
+def portemonnees() -> Iterator[ExitStack]:
+    """Sluit na de test elke portemonnee die erin is gezet (`enter_context`)."""
+    with ExitStack() as stack:
+        yield stack
+
+
+@pytest.fixture
+def verleen(omgeving: Omgeving, portemonnees: ExitStack) -> Verlener:
     """Fabriek: agent vraagt, medewerker zegt ja, agent haalt op."""
 
     def maak(
@@ -84,7 +92,9 @@ def verleen(omgeving: Omgeving) -> Verlener:
         doel: str = "aanvraag-levensonderhoud",
         agent: Portemonnee | None = None,
     ) -> Mandaat:
-        agent = agent or Portemonnee(Sleutelpaar.nieuw("test-agent"), omgeving.uitgever)
+        agent = agent or portemonnees.enter_context(
+            Portemonnee(Sleutelpaar.nieuw("test-agent"), omgeving.uitgever)
+        )
         verzoek_id = agent.vraag_mandaat(naam, doel, ["inkomen:lezen"], dossiers or ["2026-0142"])
         antwoord = omgeving.portaal(naam).beslis(verzoek_id, "ja", 300)
         assert antwoord.status_code == 200, antwoord.text
@@ -150,12 +160,18 @@ def inkomen(uitkomst: Uitkomst) -> dict[str, Any]:
     return json.loads(resultaat["content"][0]["text"])
 
 
-def wacht_tot(conditie: Callable[[], bool], max_s: float, stap_s: float = 0.5) -> float:
-    """Wacht tot de conditie waar is; geeft de verstreken tijd. Faalt na `max_s`."""
-    start = time.time()
+def tot_weigering(doe_aanroep: Callable[[], Uitkomst], ingetrokken_op: float, ttl: int) -> Uitkomst:
+    """Roep aan tot het register weigert en bewaak de grens van de statuscache.
+
+    De verifier gebruikt een statuslijst hoogstens `ttl` seconden na het begin van de download;
+    een download van vóór de intrekking begon dus vóór `ingetrokken_op`. Een aanroep die eerder
+    dan `ttl` seconden na de intrekking begint, mag nog slagen; een latere niet meer.
+    """
     while True:
-        if conditie():
-            return time.time() - start
-        if time.time() - start > max_s:
-            raise AssertionError(f"conditie niet waar binnen {max_s} s")
-        time.sleep(stap_s)
+        begin = time.time()
+        uitkomst = doe_aanroep()
+        if uitkomst.status != 200:
+            return uitkomst
+        verstreken = begin - ingetrokken_op
+        assert verstreken < ttl, f"{verstreken:.2f} s na de intrekking toegestaan (ttl {ttl} s)"
+        time.sleep(0.25)

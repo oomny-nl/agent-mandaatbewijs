@@ -27,6 +27,15 @@ SYSTEEMPROMPT = (
 INSTRUCTIE = re.compile(r"INSTRUCTIE VOOR DE ASSISTENT", re.IGNORECASE)
 DOSSIERNR = re.compile(r"\b\d{4}-\d{4}\b")
 LOKALE_TOOL = "dossier_lezen"
+LLM_OMGEVING = (
+    "AZURE_OPENAI_ENDPOINT",
+    "AZURE_OPENAI_DEPLOYMENT",
+    "AZURE_OPENAI_API_KEY",
+    "OPENAI_API_VERSION",
+    "OPENAI_BASE_URL",
+    "OPENAI_MODEL",
+    "OPENAI_API_KEY",
+)
 
 
 def _oproep(naam: str, **argumenten: str) -> dict[str, Any]:
@@ -85,11 +94,35 @@ def deterministische_planner(berichten: Sequence[AnyMessage]) -> AIMessage:
         stappen = _gekaapte_stappen(dossier, gedaan)
         if stappen:
             return AIMessage(content="", tool_calls=stappen)
-    geweigerd = [f"{r.name} ({r.content})" for r in resultaten if r.status == "error"]
+    mislukt = [f"{r.name} ({r.content})" for r in resultaten if r.status == "error"]
     samenvatting = f"Klaar met dossier {dossier}."
-    if geweigerd:
-        samenvatting += " Geweigerd: " + "; ".join(geweigerd)
+    if mislukt:
+        samenvatting += " Niet gelukt: " + "; ".join(mislukt)
     return AIMessage(content=samenvatting)
+
+
+def llm_model() -> Any:
+    """Het chatmodel uit de omgeving: Azure OpenAI als `AZURE_OPENAI_ENDPOINT` gezet is.
+
+    Een lege variabele telt als niet gezet. Compose geeft een niet-ingevulde variabele uit `.env`
+    door als lege string, en de OpenAI-SDK zou een lege `OPENAI_BASE_URL` als basis-URL gebruiken
+    en een leeg `OPENAI_MODEL` als modelnaam. Daarom verdwijnen lege waarden eerst uit de omgeving
+    van dit proces.
+
+    Returns:
+        Een LangChain-chatmodel.
+    """
+    # Optionele extra `llm`: alleen nodig als PLANNER=llm.
+    from langchain_openai import AzureChatOpenAI, ChatOpenAI  # noqa: PLC0415
+
+    for naam in LLM_OMGEVING:
+        if os.environ.get(naam) == "":
+            del os.environ[naam]
+    if "AZURE_OPENAI_ENDPOINT" in os.environ:
+        return AzureChatOpenAI(
+            azure_deployment=os.environ["AZURE_OPENAI_DEPLOYMENT"], temperature=0
+        )
+    return ChatOpenAI(model=os.environ.get("OPENAI_MODEL", "gpt-4.1-mini"), temperature=0)
 
 
 def llm_planner(tools: list[dict[str, Any]]) -> Planner:
@@ -104,16 +137,7 @@ def llm_planner(tools: list[dict[str, Any]]) -> Planner:
     Returns:
         Een planner die het model aanroept.
     """
-    # Optionele extra `llm`: alleen nodig als PLANNER=llm.
-    from langchain_openai import AzureChatOpenAI, ChatOpenAI  # noqa: PLC0415
-
-    if os.environ.get("AZURE_OPENAI_ENDPOINT"):
-        model: Any = AzureChatOpenAI(
-            azure_deployment=os.environ["AZURE_OPENAI_DEPLOYMENT"], temperature=0
-        )
-    else:
-        model = ChatOpenAI(model=os.environ.get("OPENAI_MODEL", "gpt-4.1-mini"), temperature=0)
-    gebonden = model.bind_tools(tools)
+    gebonden = llm_model().bind_tools(tools)
 
     def plan(berichten: Sequence[AnyMessage]) -> AIMessage:
         antwoord = gebonden.invoke([SystemMessage(SYSTEEMPROMPT), *berichten])

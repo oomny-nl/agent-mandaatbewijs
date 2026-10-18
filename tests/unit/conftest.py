@@ -83,3 +83,58 @@ def audit(uitgever: Dienst) -> list[dict[str, Any]]:
     """Auditrecords van de uitgever."""
     pad = uitgever.inst.datamap / "audit.jsonl"
     return [json.loads(r) for r in pad.read_text().splitlines()] if pad.exists() else []
+
+
+class VolVolume:
+    """Bestandsgrens die bij `ab` eerst `deel` bytes schrijft en dan `OSError(28)` geeft.
+
+    Met `truncate_faalt` mislukt ook het terugzetten. Met `deel=None` slaagt het schrijven
+    volledig; `sluiten_faalt` geeft dan na het sluiten `OSError(5)`. Alleen appends op `pad`
+    worden geraakt.
+    """
+
+    def __init__(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        pad: Path,
+        deel: int | None,
+        truncate_faalt: bool = False,
+        sluiten_faalt: bool = False,
+    ) -> None:
+        self.pad, self.deel, self.actief = pad, deel, True
+        self.truncate_faalt, self.sluiten_faalt = truncate_faalt, sluiten_faalt
+        echt = Path.open
+
+        def open_(p: Path, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+            f = echt(p, mode, *args, **kwargs)
+            return _Half(f, self) if self.actief and mode == "ab" and p == self.pad else f
+
+        monkeypatch.setattr(Path, "open", open_)
+
+
+class _Half:
+    def __init__(self, f: Any, grens: VolVolume) -> None:
+        self.f, self.grens = f, grens
+
+    def __enter__(self) -> _Half:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.f.close()
+        if self.grens.sluiten_faalt:
+            raise OSError(5, "Input/output error")
+
+    def write(self, data: bytes) -> int:
+        if self.grens.deel is None:
+            return self.f.write(data)
+        self.f.write(data[: self.grens.deel])
+        self.f.flush()
+        raise OSError(28, "No space left on device")
+
+    def truncate(self, lengte: int) -> int:
+        if self.grens.truncate_faalt:
+            raise OSError(5, "Input/output error")
+        return self.f.truncate(lengte)
+
+    def __getattr__(self, naam: str) -> Any:
+        return getattr(self.f, naam)

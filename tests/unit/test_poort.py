@@ -6,13 +6,20 @@ import json
 from pathlib import Path
 from typing import Any, cast
 
+import pytest
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from mandaatbewijs.audit import Auditlog, lees
-from mandaatbewijs.verifier.poort import MAX_BODY, Mandaatpoort, Poortinstellingen, ontleed_rpc
+from mandaatbewijs.verifier.poort import (
+    MAX_BODY,
+    Achtergrondtaak,
+    Mandaatpoort,
+    Poortinstellingen,
+    ontleed_rpc,
+)
 from mandaatbewijs.verifier.verificatie import Toelating, Verificatie, Weigering
 
 NONCE_URL = "http://inkomensregister:8000/nonces"
@@ -119,10 +126,75 @@ def test_weigering_geeft_status_en_reden(tmp_path: Path) -> None:
 
 
 def test_body_te_groot_en_presentatie_te_groot(tmp_path: Path) -> None:
-    client, _ = _app(tmp_path, _Verificatie())
+    verificatie = _Verificatie()
+    client, pad = _app(tmp_path, verificatie)
     assert client.post("/mcp", content=b"x" * (MAX_BODY + 1)).status_code == 413
+    record = lees(pad)[-1]
+    assert (record["gebeurtenis"], record["reden"], record["grens"]) == (
+        "geweigerd",
+        "verzoek_te_groot",
+        MAX_BODY,
+    )
+    assert "xxxx" not in json.dumps(record)
     lang = client.post("/mcp", json=_aanroep(), headers={"Authorization": "Mandaat " + "a" * 20000})
     assert lang.status_code == 401
+    assert 'error="presentatie_te_groot"' in lang.headers["www-authenticate"]
+    assert lees(pad)[-1]["reden"] == "presentatie_te_groot"
+    assert verificatie.gezien == []
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        [("Authorization", b"Mandaat a~b\xff~c")],
+        [("Authorization", "Mandaat a~b~c"), ("Authorization", "Mandaat d~e~f")],
+    ],
+    ids=["buiten-ascii", "twee-headers"],
+)
+def test_misvormde_authorization_header_is_een_geauditeerde_weigering(
+    tmp_path: Path, headers: list[tuple[str, Any]]
+) -> None:
+    """Geen serverfout en geen verificatie: 401 `presentatie_ongeldig` met een auditrecord."""
+    verificatie = _Verificatie()
+    client, pad = _app(tmp_path, verificatie)
+    antwoord = client.post("/mcp", json=_aanroep(), headers=headers)
+    assert antwoord.status_code == 401
+    assert 'error="presentatie_ongeldig"' in antwoord.headers["www-authenticate"]
+    record = lees(pad)[-1]
+    assert (record["gebeurtenis"], record["reden"], record["tool"]) == (
+        "geweigerd",
+        "presentatie_ongeldig",
+        "inkomen_opvragen",
+    )
+    assert verificatie.gezien == []
+
+
+def test_afsluiten_stopt_de_achtergrondtaak_en_sluit_de_verbindingen(tmp_path: Path) -> None:
+    gebeurd: list[str] = []
+
+    async def werk() -> None:
+        gebeurd.append("werk")
+
+    async def afsluiten() -> None:
+        gebeurd.append("afsluiten")
+
+    binnen = Starlette(routes=[])
+    inst = Poortinstellingen(
+        cast(Verificatie, _Verificatie()),
+        Auditlog(tmp_path / "audit.jsonl", "lir"),
+        NONCE_URL,
+        Achtergrondtaak(werk, 3600),
+        afsluiten=afsluiten,
+    )
+    poort = Mandaatpoort(binnen, inst)
+    with TestClient(poort):
+        taak = poort._taak
+        assert taak is not None
+        assert not taak.done()
+        assert gebeurd == []
+    assert taak.cancelled()
+    assert poort._taak is None
+    assert gebeurd == ["afsluiten"]
 
 
 def test_andere_paden_vrij(tmp_path: Path) -> None:

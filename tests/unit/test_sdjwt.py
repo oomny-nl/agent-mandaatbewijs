@@ -534,3 +534,173 @@ def test_controleer_uitgifte_aan_houderskant(
             agent.jkt,
         )
     assert reden(fout) == "disclosure_onbekend"
+
+
+def _presentatie(
+    uitgever: Sleutelpaar,
+    agent: Sleutelpaar,
+    extra: dict[str, Any],
+    disclosures: list[Disclosure] | None = None,
+) -> str:
+    """Presentatie van een zelf samengestelde payload zonder de selectieve profielclaims."""
+    payload = claims_voor(agent, int(time.time()))
+    for naam in VERBORGEN | PER_ELEMENT:
+        payload.pop(naam)
+    payload.update(extra)
+    gekozen = disclosures or []
+    jwt = teken_met_payload(uitgever, payload)
+    return presenteer(Credential(jwt, gekozen, payload), gekozen, agent, AUD, "n-1")
+
+
+def _weigering(uitgever: Sleutelpaar, presentatie: str) -> str:
+    with pytest.raises(SdJwtFout) as fout:
+        verifieer(ontleed(presentatie), uitgever.sleutel, AUD)
+    return reden(fout)
+
+
+def test_geneste_sd_alg_wordt_geweigerd(uitgever: Sleutelpaar, agent: Sleutelpaar) -> None:
+    """RFC 9901 §4.1.1: `_sd_alg` alleen op het hoogste niveau, nooit genest."""
+    pres = _presentatie(uitgever, agent, {"extra": {"_sd_alg": "sha-512", "a": 1}})
+    assert _weigering(uitgever, pres) == "sd_alg_ongeldig"
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"x": {"...": 123}},
+        {"x": {"...": digest("y")}},
+        {"x": [{"...": digest("y"), "ander": 1}]},
+        {"x": [{"...": 123}]},
+    ],
+)
+def test_drie_punten_buiten_een_array_digest_wordt_geweigerd(
+    uitgever: Sleutelpaar, agent: Sleutelpaar, extra: dict[str, Any]
+) -> None:
+    """RFC 9901 §4.1 regel 7 en §4.2.4.2: `...` alleen als enige sleutel van een array-element."""
+    assert _weigering(uitgever, _presentatie(uitgever, agent, extra)) == "sd_ongeldig"
+
+
+@pytest.mark.parametrize("met_sd_alg", [True, False])
+def test_disclosure_met_naam_sd_alg_wordt_geweigerd(
+    uitgever: Sleutelpaar, agent: Sleutelpaar, met_sd_alg: bool
+) -> None:
+    """De botsing telt tegen de ontvangen sleutels, vóór `_sd_alg` wordt verwijderd (§7.1)."""
+    d = Disclosure.nieuw("_sd_alg", "sha-512")
+    extra: dict[str, Any] = {"_sd": [d.digest]}
+    if met_sd_alg:
+        extra["_sd_alg"] = "sha-256"
+    pres = _presentatie(uitgever, agent, extra, [d])
+    assert _weigering(uitgever, pres) == "claimnaam_ongeldig"
+
+
+def test_disclosure_die_botst_met_genest_object_wordt_geweigerd(
+    uitgever: Sleutelpaar, agent: Sleutelpaar
+) -> None:
+    d = Disclosure.nieuw("naam", "Vervalst")
+    pres = _presentatie(uitgever, agent, {"medewerker": {"naam": "Echt", "_sd": [d.digest]}}, [d])
+    assert _weigering(uitgever, pres) == "claimnaam_ongeldig"
+
+
+@pytest.mark.parametrize(
+    "tekst",
+    ["YWJj=", "YWJjZA==", "YW Jj", "YW+j", "YW/j", "YWJjZ", "YR", "YéJj", "YWJj\n"],
+)
+def test_base64url_is_strikt(tekst: str) -> None:
+    """Geen padding, witruimte, +/ of onmogelijke lengte; opvulbits moeten nul zijn."""
+    with pytest.raises(ValueError, match="base64url"):
+        sdjwt.b64url_decode(tekst)
+
+
+def test_base64url_canoniek_wordt_gelezen() -> None:
+    assert sdjwt.b64url_decode("YWJj") == b"abc"
+    assert sdjwt.b64url_decode("YWI") == b"ab"
+    assert sdjwt.b64url_decode("") == b""
+
+
+def test_disclosure_met_padding_is_ongeldig(credential: Credential) -> None:
+    d = credential.disclosures[0]
+    with pytest.raises(SdJwtFout) as fout:
+        Disclosure.decodeer(d.gecodeerd + "=")
+    assert reden(fout) == "disclosure_ongeldig"
+
+
+def test_presentatie_met_niet_ascii_wordt_geweigerd(
+    credential: Credential, agent: Sleutelpaar
+) -> None:
+    pres = presenteer(credential, kies(credential), agent, AUD, "n-1")
+    with pytest.raises(SdJwtFout) as fout:
+        ontleed(pres.replace("~", "~é", 1))
+    assert reden(fout) == "presentatie_ongeldig"
+
+
+@pytest.mark.parametrize("kop", [b'["alg"]', b'"ab"'])
+def test_jose_kop_die_geen_object_is_wordt_geweigerd(
+    credential: Credential, uitgever: Sleutelpaar, agent: Sleutelpaar, kop: bytes
+) -> None:
+    pres = presenteer(credential, kies(credential), agent, AUD, "n-1")
+    jwt, *disclosures, kb = pres.split("~")
+    _, payload, handtekening = jwt.split(".")
+    vervalst = "~".join([f"{b64url(kop)}.{payload}.{handtekening}", *disclosures, kb])
+    with pytest.raises(SdJwtFout) as fout:
+        ontleed(vervalst)
+    assert reden(fout) == "jwt_ongeldig"
+    _, kb_payload, kb_handtekening = kb.split(".")
+    vervalste_kb = "~".join([jwt, *disclosures, f"{b64url(kop)}.{kb_payload}.{kb_handtekening}"])
+    with pytest.raises(SdJwtFout) as fout:
+        verifieer(ontleed(vervalste_kb), uitgever.sleutel, AUD)
+    assert reden(fout) == "kb_jwt_ongeldig"
+
+
+@pytest.mark.parametrize(
+    "aud",
+    ["https://ander-register.test", ["https://ander-register.test"], [AUD, 7], 7, []],
+)
+def test_credential_voor_een_andere_ontvanger_wordt_geweigerd(
+    uitgever: Sleutelpaar, agent: Sleutelpaar, aud: Any
+) -> None:
+    """RFC 7519 §4.1.3: een aanwezige credential-aud moet deze verifier noemen."""
+    assert _weigering(uitgever, _presentatie(uitgever, agent, {"aud": aud})) == "aud_onjuist"
+
+
+@pytest.mark.parametrize("aud", [AUD, [AUD], ["https://ander-register.test", AUD]])
+def test_credential_met_deze_ontvanger_wordt_toegelaten(
+    uitgever: Sleutelpaar, agent: Sleutelpaar, aud: Any
+) -> None:
+    g = verifieer(ontleed(_presentatie(uitgever, agent, {"aud": aud})), uitgever.sleutel, AUD)
+    assert g.claims["aud"] == aud
+
+
+def test_verborgen_aud_wordt_geweigerd(uitgever: Sleutelpaar, agent: Sleutelpaar) -> None:
+    """Een selectieve aud zou de houder laten kiezen of de verifier haar te zien krijgt."""
+    d = Disclosure.nieuw("aud", "https://ander-register.test")
+    pres = _presentatie(uitgever, agent, {"_sd": [d.digest]}, [d])
+    assert _weigering(uitgever, pres) == "claimnaam_ongeldig"
+
+
+@pytest.mark.parametrize(
+    ("iss", "url"),
+    [
+        ("https://example.com", "https://example.com/.well-known/jwt-vc-issuer"),
+        ("https://example.com/", "https://example.com/.well-known/jwt-vc-issuer"),
+        (
+            "https://example.com/tenant/1234",
+            "https://example.com/.well-known/jwt-vc-issuer/tenant/1234",
+        ),
+        (
+            "https://example.com/tenant/1234/",
+            "https://example.com/.well-known/jwt-vc-issuer/tenant/1234",
+        ),
+        ("http://uitgever:8000", "http://uitgever:8000/.well-known/jwt-vc-issuer"),
+    ],
+)
+def test_metadata_url_volgens_sd_jwt_vc(iss: str, url: str) -> None:
+    """SD-JWT VC §4 en §4.1: het well-known-pad staat vóór het pad van de uitgever."""
+    assert sdjwt.metadata_url(iss) == url
+
+
+@pytest.mark.parametrize(
+    "iss", ["https://example.com/?a=1", "https://example.com/#x", "https://e.com?"]
+)
+def test_metadata_url_weigert_query_en_fragment(iss: str) -> None:
+    with pytest.raises(ValueError, match="query of fragment"):
+        sdjwt.metadata_url(iss)

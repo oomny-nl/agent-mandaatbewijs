@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 from typing import Any
@@ -9,9 +10,12 @@ from typing import Any
 import httpx2
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from mcp.shared.exceptions import MCPError
+from mcp_types import INTERNAL_ERROR, INVALID_PARAMS
 from starlette.testclient import TestClient
 
-from mandaatbewijs.houder.planner import deterministische_planner
+from mandaatbewijs.houder.graaf import Gereedschap, Toolbeleid
+from mandaatbewijs.houder.planner import LLM_OMGEVING, deterministische_planner, llm_model
 from mandaatbewijs.houder.portemonnee import Portemonnee, PortemonneeFout
 from mandaatbewijs.houder.verbinding import MandaatAuth, reden
 from mandaatbewijs.sdjwt import Disclosure, b64url, ontleed, serialiseer
@@ -118,6 +122,36 @@ def test_planner_zonder_dossiernummer() -> None:
     assert not antwoord.tool_calls
 
 
+def test_llm_model_behandelt_lege_omgevingsvariabelen_als_niet_gezet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Compose geeft niet-ingevulde variabelen leeg door; dan gelden de standaardwaarden."""
+    pytest.importorskip("langchain_openai")
+    for naam in LLM_OMGEVING:
+        monkeypatch.setenv(naam, "")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    model = llm_model()
+    assert type(model).__name__ == "ChatOpenAI"
+    assert model.model_name == "gpt-4.1-mini"
+    assert str(model.root_client.base_url) == "https://api.openai.com/v1/"
+
+
+def test_llm_model_kiest_azure_met_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("langchain_openai")
+    for naam in LLM_OMGEVING:
+        monkeypatch.setenv(naam, "")
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://voorbeeld.openai.azure.com")
+    monkeypatch.setenv("AZURE_OPENAI_DEPLOYMENT", "assistent")
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "test")
+    monkeypatch.setenv("OPENAI_API_VERSION", "2024-10-21")
+    model = llm_model()
+    assert type(model).__name__ == "AzureChatOpenAI"
+    assert model.deployment_name == "assistent"
+    assert str(model.root_client.base_url).startswith(
+        "https://voorbeeld.openai.azure.com/openai/deployments/assistent"
+    )
+
+
 def test_uitgever_app_is_herbruikbaar(uitgever: Dienst) -> None:
     assert maak_app(uitgever).title.startswith("Uitgever")
 
@@ -165,3 +199,133 @@ def test_portemonnee_weigert_credential_zonder_bekende_uitgeverssleutel(
     vreemd = Portemonnee(agent.sleutel, "http://localhost:9999", http=uitgever_client)  # type: ignore[arg-type]
     with pytest.raises(PortemonneeFout):
         vreemd.controleer(serialiseer(echt.jwt, echt.disclosures, None))
+
+
+def test_mandaat_auth_weigering_hoort_bij_de_laatste_aanroep() -> None:
+    """Een oude 401 blijft niet hangen: een volgende aanroep zonder weigering wist hem."""
+    auth = MandaatAuth()
+    for status, kop, verwacht in [
+        (403, 'Mandaat error="mandaat_ingetrokken"', 'Mandaat error="mandaat_ingetrokken"'),
+        (200, None, None),
+        (500, None, None),
+    ]:
+        auth.volgende = "p"
+        flow = auth.auth_flow(httpx2.Request("POST", "http://r/mcp", json={"method": "tools/call"}))
+        verzoek = next(flow)
+        koppen = {"www-authenticate": kop} if kop else {}
+        with contextlib.suppress(StopIteration):
+            flow.send(httpx2.Response(status, request=verzoek, headers=koppen))
+        assert auth.laatste_weigering == verwacht
+
+
+class _Inhoud:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+class _Antwoord:
+    def __init__(self, text: str, is_error: bool) -> None:
+        self.content = [_Inhoud(text)]
+        self.is_error = is_error
+
+
+class _Register:
+    """MCP-client die een vooraf gekozen uitkomst geeft, zoals de echte client die doorgeeft."""
+
+    def __init__(self, auth: MandaatAuth, uitkomst: Any, weigering: str | None = None) -> None:
+        self.auth, self.uitkomst, self.weigering = auth, uitkomst, weigering
+
+    async def call_tool(self, naam: str, argumenten: dict[str, Any]) -> _Antwoord:
+        if self.weigering is not None:  # wat MandaatAuth bij een 401/403 op deze aanroep vastlegt
+            self.auth.laatste_weigering = self.weigering
+        if isinstance(self.uitkomst, Exception):
+            raise self.uitkomst
+        return self.uitkomst
+
+
+class _Portemonnee:
+    def disclosures_voor(self, actie: str, dossier: str, met_doel: bool) -> list[Disclosure]:
+        return []
+
+    def presentatie(self, aud: str, nonce: str, gekozen: list[Disclosure]) -> str:
+        return "presentatie"
+
+
+@pytest.mark.parametrize(
+    ("uitkomst", "weigering", "soort", "tekst"),
+    [
+        (
+            MCPError(INTERNAL_ERROR, "Server returned an error response"),
+            'Mandaat error="dossier_buiten_mandaat"',
+            "register_weigert",
+            "GEWEIGERD door het register: dossier_buiten_mandaat",
+        ),
+        (
+            MCPError(INVALID_PARAMS, "Unknown tool: verwijder_alles"),
+            None,
+            "register_fout",
+            f"protocolfout (MCP {INVALID_PARAMS}): Unknown tool: verwijder_alles",
+        ),
+        (
+            _Antwoord("geen inkomensgegevens voor dossier 2026-0142", True),
+            None,
+            "register_fout",
+            "toolfout: geen inkomensgegevens voor dossier 2026-0142",
+        ),
+        (_Antwoord('{"bruto_per_maand": 1}', False), None, "resultaat", '{"bruto_per_maand": 1}'),
+    ],
+)
+def test_toolknoop_onderscheidt_weigering_protocolfout_en_toolfout(
+    uitkomst: Any, weigering: str | None, soort: str, tekst: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Een MCP-fout is pas een registerweigering als de poort juist deze aanroep weigerde."""
+    auth = MandaatAuth()
+    # Een weigering van een eerdere aanroep mag de uitkomst van deze aanroep niet kleuren.
+    auth.laatste_weigering = 'Mandaat error="mandaat_ingetrokken"'
+    gezien: list[dict[str, Any]] = []
+    register: Any = _Register(auth, uitkomst, weigering)
+    portemonnee: Any = _Portemonnee()
+    gereedschap = Gereedschap(
+        register,
+        auth,
+        portemonnee,
+        "http://register",
+        {"inkomen_opvragen": Toolbeleid("inkomen:lezen", ())},
+        gezien.append,
+    )
+
+    async def nonce() -> str:
+        return "n"
+
+    monkeypatch.setattr(gereedschap, "nonce", nonce)
+    bericht = asyncio.run(gereedschap.voer_uit("inkomen_opvragen", {"dossier": "2026-0142"}))
+    assert gezien[-1] == {"soort": soort, "tool": "inkomen_opvragen", "tekst": tekst}
+    assert bericht.content == tekst
+    assert bericht.status == ("success" if soort == "resultaat" else "error")
+
+
+def test_portemonnee_weigert_credential_met_kop_die_geen_object_is() -> None:
+    """Een JOSE-kop als JSON-lijst is een leesfout, geen AttributeError (RFC 7515 §4)."""
+    agent = Portemonnee(Sleutelpaar.nieuw("a"), ISS, http=httpx2.Client())
+    with agent, pytest.raises(PortemonneeFout, match="credential onleesbaar"):
+        agent.controleer(f"{b64url(b'[1]')}.{b64url(b'{}')}.{b64url(b'x')}~")
+    assert agent.http.is_closed
+
+
+def test_portemonnee_vindt_metadata_onder_het_pad_van_iss() -> None:
+    """SD-JWT VC §4: het well-known-pad staat vóór het pad van `iss`, niet erachter."""
+    gevraagd: list[str] = []
+
+    def antwoord(verzoek: httpx2.Request) -> httpx2.Response:
+        gevraagd.append(str(verzoek.url))
+        return httpx2.Response(404)
+
+    iss = "https://uitgever.example/gemeente/lindevoort"
+    http = httpx2.Client(transport=httpx2.MockTransport(antwoord))
+    with Portemonnee(Sleutelpaar.nieuw("a"), iss, http=http) as agent:
+        with pytest.raises(PortemonneeFout, match="HTTP 404"):
+            agent._uitgeverssleutel("k1")
+        geen_query = Portemonnee(agent.sleutel, f"{iss}?x=1", http=http)
+        with pytest.raises(PortemonneeFout, match="query of fragment"):
+            geen_query._uitgeverssleutel("k1")
+    assert gevraagd == ["https://uitgever.example/.well-known/jwt-vc-issuer/gemeente/lindevoort"]

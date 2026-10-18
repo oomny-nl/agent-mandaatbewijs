@@ -3,12 +3,14 @@
 Elke `tools/call` op `/mcp` draagt een presentatie in `Authorization: Mandaat <sd-jwt+kb>` en wordt
 vóór de tool door de acht stappen van ONTWERP §7 gehaald. Zonder presentatie zijn alleen de
 JSON-RPC-methoden uit de allowlist toegestaan (`initialize`, `notifications/initialized`, `ping`,
-`tools/list`). Elke beslissing krijgt een auditrecord; headers worden nooit gelogd.
+`tools/list`). Elke beslissing krijgt een auditrecord, ook een te grote body of een misvormde
+header; headers en bodies worden nooit gelogd.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 from collections.abc import Awaitable, Callable
@@ -79,12 +81,28 @@ def _auditvelden(weigering: Weigering) -> dict[str, Any]:
     return velden
 
 
-def _presentatie(headers: dict[str, str]) -> str | None:
-    waarde = headers.get("authorization", "")
+def _presentatie(headers: list[tuple[bytes, bytes]]) -> str:
+    """De presentatie uit precies één `Authorization: Mandaat ...`-header (ASGI: ruwe bytes).
+
+    Raises:
+        Weigering: Bij geen of een ander schema (`presentatie_ontbreekt`), meer dan één header
+            of bytes buiten US-ASCII (`presentatie_ongeldig`) en een te lange waarde.
+    """
+    waarden = [v for k, v in headers if k.lower() == b"authorization"]
+    if not waarden:
+        raise Weigering("presentatie_ontbreekt")
+    if len(waarden) > 1:
+        raise Weigering("presentatie_ongeldig", 401, "meer dan één Authorization-header")
+    try:
+        waarde = waarden[0].decode("ascii")
+    except UnicodeDecodeError as fout:
+        raise Weigering("presentatie_ongeldig", 401, "header buiten US-ASCII") from fout
     schema, _, rest = waarde.partition(" ")
     if schema.lower() != SCHEMA.lower() or not rest.strip():
-        return None
-    return rest.strip() if len(rest) <= MAX_PRESENTATIE else None
+        raise Weigering("presentatie_ontbreekt")
+    if len(rest.strip()) > MAX_PRESENTATIE:
+        raise Weigering("presentatie_te_groot", 401, f"meer dan {MAX_PRESENTATIE} tekens")
+    return rest.strip()
 
 
 @dataclass(frozen=True)
@@ -112,6 +130,7 @@ class Poortinstellingen:
     audit: Auditlog
     nonce_url: str
     achtergrond: Achtergrondtaak | None = None
+    afsluiten: Callable[[], Awaitable[None]] | None = None
 
 
 class Mandaatpoort:
@@ -127,11 +146,24 @@ class Mandaatpoort:
             bericht = await receive()
             if bericht["type"] == "lifespan.startup" and self.inst.achtergrond is not None:
                 self._taak = asyncio.create_task(self.inst.achtergrond.draai())
-            elif bericht["type"] == "lifespan.shutdown" and self._taak is not None:
-                self._taak.cancel()
+            elif bericht["type"] == "lifespan.shutdown":
+                await self._stop()
             return bericht
 
         await self.app(scope, ontvang, send)
+
+    async def _stop(self) -> None:
+        """Stop de achtergrondtaak en sluit daarna de verbindingen (`afsluiten`)."""
+        if self._taak is not None:
+            self._taak.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._taak
+            self._taak = None
+        if self.inst.afsluiten is not None:
+            try:
+                await self.inst.afsluiten()
+            except Exception:
+                log.exception("afsluiten van de poort mislukt")
 
     async def _antwoord(self, send: Send, status: int, reden: str, headers: list[Any]) -> None:
         body = json.dumps({"error": reden}).encode()
@@ -164,6 +196,7 @@ class Mandaatpoort:
         try:
             body = await _lees_body(receive)
         except TeGroot:
+            self._audit("geweigerd", None, None, reden="verzoek_te_groot", grens=MAX_BODY)
             await self._antwoord(send, 413, "verzoek_te_groot", [])
             return
         if scope["method"] == "POST":
@@ -187,13 +220,8 @@ class Mandaatpoort:
         aanroep: tuple[str | None, str | None],
     ) -> None:
         tool, dossier = aanroep
-        headers = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
-        presentatie = _presentatie(headers)
-        if presentatie is None:
-            self._audit("geweigerd", tool, dossier, reden="presentatie_ontbreekt")
-            await self._weiger(send, 401, "presentatie_ontbreekt")
-            return
         try:
+            presentatie = _presentatie(scope["headers"])
             toelating = await self.inst.verificatie.verifieer(presentatie, tool or "", dossier)
         except Weigering as weigering:
             self._audit(

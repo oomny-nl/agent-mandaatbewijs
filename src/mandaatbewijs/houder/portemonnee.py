@@ -12,12 +12,18 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import httpx2
-from joserfc import jws
 from joserfc.errors import JoseError
 from joserfc.jwk import ECKey
 
-from mandaatbewijs.sdjwt import Credential, Disclosure, SdJwtFout, controleer_uitgifte, presenteer
-from mandaatbewijs.sleutels import Sleutelpaar, publieke_sleutel
+from mandaatbewijs.sdjwt import (
+    Credential,
+    Disclosure,
+    SdJwtFout,
+    controleer_uitgifte,
+    metadata_url,
+    presenteer,
+)
+from mandaatbewijs.sleutels import Sleutelpaar, jose_kop, publieke_sleutel
 
 TYP_PROOF = "mandaatbewijs-proof+jwt"
 
@@ -40,6 +46,16 @@ class Portemonnee:
     uitgever: str
     credential: Credential | None = None
     http: httpx2.Client = field(default_factory=lambda: httpx2.Client(timeout=10))
+
+    def sluit(self) -> None:
+        """Sluit de HTTP-client naar de uitgever."""
+        self.http.close()
+
+    def __enter__(self) -> Portemonnee:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.sluit()
 
     @property
     def jkt(self) -> str:
@@ -90,8 +106,8 @@ class Portemonnee:
         """
         try:
             credential = Credential.uit_serialisatie(serialisatie)
-            kid = jws.extract_compact(credential.jwt.encode()).protected.get("kid")
-        except (SdJwtFout, JoseError, ValueError) as fout:
+            kid = jose_kop(credential.jwt).get("kid")
+        except (SdJwtFout, ValueError) as fout:
             raise PortemonneeFout(f"credential onleesbaar: {fout}") from fout
         if not isinstance(kid, str):
             raise PortemonneeFout("credential zonder kid")
@@ -102,7 +118,11 @@ class Portemonnee:
         return credential
 
     def _uitgeverssleutel(self, kid: str) -> ECKey:
-        meta = self._json(f"{self.uitgever}/.well-known/jwt-vc-issuer")
+        try:
+            url = metadata_url(self.uitgever)
+        except ValueError as fout:
+            raise PortemonneeFout(f"uitgeversmetadata: {fout}") from fout
+        meta = self._json(url)
         if meta.get("issuer") != self.uitgever:
             raise PortemonneeFout("uitgeversmetadata: issuer klopt niet")
         jwks = meta.get("jwks")

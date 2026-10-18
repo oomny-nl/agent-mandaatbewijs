@@ -18,9 +18,10 @@ and logs every decision. The agent is a LangGraph agent that calls its tools ove
 
 It is the second answer to the same question as [`agent-mandaat`](https://github.com/oomny-nl/agent-mandaat).
 There, one Keycloak inside one organisation issues a token per tool action and the API asks it live
-whether the token is still active. Here the agent carries the mandate itself, and the verifier has
-no account at the municipality and no live dependency: only a trust list and two cached public
-files.
+whether the token is still active. Here the agent carries the mandate itself. The verifier has
+no account at the municipality and does not ask on every call whether the mandate still holds: it
+works with a trust list and cached public files from the municipality (keys and status list). Only
+an empty or expired cache triggers a fetch.
 
 The premise is the same: the model may be hijacked. The boundary lies in the credential and in the
 verifier, not in the prompt. In the demo the agent reads a case file containing an injected
@@ -33,17 +34,24 @@ The recording shows `make demo`: six scenarios against the real stack, followed 
 
 ## Run it yourself
 
-Requirements: Docker and `make`. Everything runs locally, without API keys and without cost.
+Requirements: Docker and `make`; `make test` and `make lint` also need
+[uv](https://docs.astral.sh/uv/). Everything runs locally, without API keys and without cost.
 
 ```bash
 make demo
 ```
 
 This starts the issuer (municipality of Lindevoort) and the income register (verifier) with
-Compose, generates keys and passwords in volumes, and plays six scenarios. It ends with the
-evidence table from both organisations' audit logs, including the check of both hash chains. If any
-outcome deviates from the design, the demo exits with an error. `make integratie` runs the
-integration tests against the same chain, `make test` the unit tests, `make lint` ruff and ty.
+Compose, generates the issuer key and the fictional employees' passwords in volumes, and plays six
+scenarios; the agent creates its key pair in memory. It ends with the evidence table from both
+organisations' audit logs: both hash chains must be intact and each log must contain the records
+the scenarios are supposed to produce. If any outcome deviates from the design, the demo exits with
+an error. `make integratie` runs the integration tests against the same chain, `make test` the unit
+tests, `make lint` ruff and ty.
+
+`make demo`, `make integratie` and `make down` wipe the Docker volumes (`docker compose down -v`):
+keys, passwords, register data and audit logs from a previous run are gone afterwards. Every run
+starts clean.
 
 To use a real language model instead of the deterministic planner, set `PLANNER=llm` in `.env`
 plus the variables for Azure OpenAI or an OpenAI-compatible endpoint (see `.env.example`) and run
@@ -64,8 +72,10 @@ same attack every time, so the checks on expected outcomes apply only to the det
 3. **Replay.** An intercepted presentation is offered again: `nonce_onbekend_of_gebruikt`. The
    same credential with a fresh nonce but signed with a thief's key: `kb_handtekening_ongeldig`.
 4. **Revoked.** Sanne revokes her mandate. The municipality sets a bit in the status list. The
-   register, which refreshes the list every five seconds, refuses the next call within those five
-   seconds: `mandaat_ingetrokken`. The demo shows both timestamps.
+   register uses a cached status list for at most `ttl` seconds (5 in the demo) after the start of
+   its download and refuses after that: `mandaat_ingetrokken`. The demo calls once per second,
+   shows after how many seconds the first refusal and the last allowed call came, and fails if a
+   call that started `ttl` seconds or more after the revocation was still allowed.
 5. **Issuer not trusted.** The municipality of Elsweerd issues a correctly signed mandate to the
    same agent. The register refuses: `uitgever_niet_vertrouwd`, without fetching anything from
    Elsweerd.
@@ -98,8 +108,8 @@ sequenceDiagram
     end
     S->>U: DELETE /mandaten/id
     U->>U: bit in the status list
-    R->>U: GET /statuslijsten/1 (every ttl seconds, on its own clock)
-    Note over R: next call: mandaat_ingetrokken
+    R->>U: GET /statuslijsten/1 (in the background, or when the cache has expired)
+    Note over R: calls from ttl seconds after the revocation: mandaat_ingetrokken
 ```
 
 ### What the mandate contains
@@ -110,9 +120,9 @@ sequenceDiagram
 | `cnf.jwk` | no | Public key of the agent (key binding) |
 | `status.status_list` | no | Index and URI of the municipality's status list |
 | `doel` | yes | The purpose the agent acts for |
-| `acties` | per element | `inkomen:lezen`, optionally `inkomen:corrigeren` |
+| `acties` | per element | `inkomen:lezen`; no role in the demo may mandate `inkomen:corrigeren` |
 | `dossiers` | per element | Case numbers from Sanne's caseload |
-| `medewerker`, `afdeling` | yes | Who granted the mandate; the register never sees this |
+| `medewerker`, `afdeling` | yes | Who granted the mandate; the register does not ask for it and the agent in this repository does not disclose it |
 
 The municipality only issues what the employee may do herself: the case must be in her caseload
 and her role must allow the action. The agent never gets more rights than the human.
@@ -132,18 +142,41 @@ goes into the audit record:
 5. The key-binding JWT is signed with the key in `cnf`, has this register as `aud`, is fresh and
    carries a nonce this register issued. The nonce is consumed at that moment, in one database
    transaction, also under concurrent requests.
-6. The municipality's status list says the mandate is valid. The register refreshes the list on its
-   own clock; a presentation only triggers a fetch when the cache is empty or expired. If the
-   municipality is unreachable, a valid cache bridges the gap until the Status List Token's `exp`;
-   after that the answer is no. A received but invalid token makes the cache unusable.
+6. The municipality's status list says the mandate is valid. The register uses a cached list for
+   at most `ttl` seconds after the start of its download, minus the age an intermediate HTTP cache
+   reports in `Age` (plus one second, because `Age` is rounded down), and never past the token's
+   `exp`. A background task refreshes the lists (every 5 seconds in Compose), so a presentation
+   rarely triggers a fetch. If the municipality is unreachable, a valid cache bridges the gap
+   until the Status List Token's `exp`; after that the answer is no. A received but invalid token
+   makes the cache unusable.
 7. The mandate covers the call: the tool's action is among the disclosed actions, the case among
    the disclosed cases, and the purpose is one the register accepts for this tool.
-8. Audit record: time, issuer, mandate id, key thumbprint, tool, action, case, disclosed claim
-   names, decision, reason and source of the status information.
+8. Audit record of every decision: time, tool, case, decision and reason. An allowed call also
+   records issuer, mandate id, key thumbprint, purpose, action, the disclosed claim names and the
+   source of the status information (`vers`, `cache` or `cache-verouderd`).
 
-Both organisations write a hash chain. The municipality logs request, consent, issuance,
-revocation and emergency stop; the register every allowed and refused call. The demo sorts both by
-time and verifies the chains.
+For revocation, step 6 means: as long as the register can reach the municipality, every call that
+starts `ttl` seconds or more after the revocation is refused. A call that starts earlier may still
+go through. If the register cannot reach the municipality, that bound moves to the `exp` of the
+last fetched token (60 seconds after signing in the demo).
+
+A refusal records what was established at that moment. If the signatures of issuer and agent
+verify, `iss`, `jti`, thumbprint and the disclosed claim names are recorded as confirmed fields
+(refusal on the mandate profile, the nonce, the status or the scope); `mandaat_ingetrokken` adds
+the status source, a scope refusal the action. An earlier refusal (no or a malformed presentation,
+unknown issuer, invalid signature of issuer or agent) has no mandate id; an `iss` from a token that
+has not been verified yet is recorded and marked as `onbevestigd` (unconfirmed). An oversized
+request and a disallowed JSON-RPC method also get a record. Headers, presentations and bodies are
+never logged.
+
+Both organisations write a hash chain. The municipality logs requests, consent (and with it the
+issuance) or refusal, retrieval, revocation and emergency stop, plus refused logins, retrievals and
+administrative actions. Every state transition and its audit event are written in one database
+transaction (transactional outbox): an issuance or revocation without an audit event cannot exist.
+The register logs every allowed and refused call. A record only counts once the complete line is on
+disk with `fsync`; a half-written line (full volume, crash) is rolled back or removed at startup, so
+the chain stays intact. The demo sorts both logs by time, verifies the chains and requires the
+expected records for each scenario, with the mandate id where it is established.
 
 ## Evidence
 
@@ -159,7 +192,8 @@ Every claim above has a test that fails when the measure is removed. A selection
 | Presentation for another register | refused | wrong `aud` | `test_kb_met_verkeerde_aud` (u) |
 | Disclosure added or removed after signing | refused | `sd_hash` mismatch | `test_disclosure_toegevoegd_na_tekenen_breekt_sd_hash` (u) |
 | Disclosure that makes `cnf` or `status` selective | refused | protected claim | `test_selectieve_subclaim_in_beschermde_claim_wordt_geweigerd` (u) |
-| Mandate revoked | refused within `ttl` | status list | `test_ingetrokken_via_statuslijst_binnen_ttl` (i) |
+| Mandate revoked | refused for every call from `ttl` after the revocation | status list | `test_ingetrokken_geen_toegang_meer_na_ttl` (i) |
+| Mandate revoked, HTTP cache between register and municipality | refused from `ttl` after the revocation | the response's `Age` counts, plus one second for rounding; a cache that serves expired responses (grace) gives bridging until `exp` | `test_tussenliggende_http_cache_verlengt_het_intrekkingsvenster_niet` (u), `test_wie_op_een_te_oude_download_wacht_maar_later_aanvroeg_haalt_zelf_op` (u) |
 | Municipality unreachable, cache valid | allowed from cache until `exp` | bridging | `test_statuscache_overbrugt_netwerkfout_maar_niet_ongeldig_token` (u) |
 | Municipality unreachable, no cache | refused | status unknown | `test_geen_cache_en_onbereikbaar_is_status_onbekend` (u) |
 | Mandate from the municipality of Elsweerd | refused without network traffic | issuer not trusted | `test_uitgever_niet_vertrouwd_zonder_netwerk` (u) |
@@ -167,6 +201,9 @@ Every claim above has a test that fails when the measure is removed. A selection
 | Agent key blocked | mandate revoked, new request refused | emergency stop | `test_noodstop_blokkeert_sleutel` (i) |
 | Bram (intake) mandates reading income | issuance refused | not authorised himself | `test_bevoegdheid_van_de_medewerker_begrenst_het_mandaat` (u) |
 | Audit record modified or omitted | chain breaks | hash chain | `test_gewijzigd_record_breekt_de_keten` (u) |
+| Audit line half written (full volume, crash) | line rolled back, chain intact | `fsync` before the chain moves on | `test_half_geschreven_regel_wordt_teruggezet` (u) |
+| Audit log missing, empty or lacking an expected record | demo fails | evidence incomplete | `test_controleer_log_eist_bestaand_gevuld_en_volledig_log` (u) |
+| MCP protocol error or tool error at the register | agent reports an error, not a refusal | separate kind | `test_toolknoop_onderscheidt_weigering_protocolfout_en_toolfout` (u) |
 
 (u) `tests/unit/`, (i) `tests/integratie/`. The full overview per OWASP risk is in
 [docs/DREIGINGSMODEL.md](docs/DREIGINGSMODEL.md) (Dutch); the design choices, the standards and the
@@ -194,11 +231,18 @@ relation to the EUDI wallet and the Dutch NL GOV profiles are in [docs/ONTWERP.m
   propagates through the status list. In production that key belongs in an HSM, TPM or key vault.
 - Whoever holds the issuer key can forge every mandate and every status list. Recovery requires
   ending trust in that key; the demo does not rotate it.
-- Revocation takes effect at the next refresh of the status list, not immediately. `ttl` is the knob.
+- Revocation is not immediate: a call that starts within `ttl` seconds of the revocation may still
+  go through, and with an unreachable municipality that bound moves to the `exp` of the cached
+  status token. `ttl` and the token's validity are the knobs.
 - All presentations of one mandate can be linked (same `jti` and key). That is intended here, but
   differs from citizen credentials.
 - Within its mandate the model can produce nonsense, and data it legitimately reads can end up in
   its output. Data minimisation and output control are separate concerns.
+- The agent chooses which claims it discloses. The register requires what it needs but does not
+  refuse a presentation for disclosing more (for example `medewerker`).
+- The register only guards its own tools. The local tool `dossier_lezen` reads the municipality's
+  case file without a credential; authorisation on the municipality's own case files is outside
+  what this repository demonstrates.
 - The trust list is a local file. In production it is a governed trust registry.
 - The address check before the connection and the connection itself are two DNS lookups; DNS
   rebinding is outside this demo.
@@ -214,7 +258,7 @@ relation to the EUDI wallet and the Dutch NL GOV profiles are in [docs/ONTWERP.m
 | `src/mandaatbewijs/houder/` | The agent: key pair, credential, presentation per call, MCP connection, planner, LangGraph |
 | `src/mandaatbewijs/verifier/` | Income register: MCP tools behind a gateway, trust list, JWKS and status cache, nonces, audit |
 | `src/mandaatbewijs/demo.py` | Orchestration of the six scenarios and the evidence table |
-| `tests/` | 140 unit tests, 14 integration tests against the real chain |
+| `tests/` | 302 unit tests, 14 integration tests against the real chain |
 | `docs/` | Design and threat model (Dutch) |
 
 Quality: `ruff`, `ty`, `pytest`, the Compose chain and gitleaks in CI. Versions are pinned

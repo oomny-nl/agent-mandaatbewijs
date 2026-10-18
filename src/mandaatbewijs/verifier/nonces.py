@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import secrets
 import sqlite3
 import time
+from collections.abc import Generator
 from pathlib import Path
 
 NONCE_GELDIG_S = 60
@@ -22,8 +24,14 @@ class Nonces:
                 " (waarde TEXT PRIMARY KEY, verloopt INTEGER NOT NULL)"
             )
 
-    def _db(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.pad, isolation_level=None, timeout=10)
+    @contextlib.contextmanager
+    def _db(self) -> Generator[sqlite3.Connection]:
+        """Een verbinding die na het blok altijd sluit (sqlite3 zelf sluit niet bij `with`)."""
+        db = sqlite3.connect(self.pad, isolation_level=None, timeout=10)
+        try:
+            yield db
+        finally:
+            db.close()
 
     def nieuw(self) -> str:
         """Geef een nieuwe nonce uit (60 seconden geldig)."""
@@ -38,14 +46,10 @@ class Nonces:
         """Verbruik een nonce; True als hij bestond en niet verlopen was. Nooit twee keer True."""
         nu = int(time.time())
         with self._db() as db:
+            # Een fout vóór COMMIT (ook in COMMIT zelf) sluit de verbinding zonder commit:
+            # SQLite draait de transactie dan terug en de nonce blijft onverbruikt.
             db.execute("BEGIN IMMEDIATE")
-            try:
-                rij = db.execute(
-                    "SELECT verloopt FROM nonces WHERE waarde = ?", (waarde,)
-                ).fetchone()
-                db.execute("DELETE FROM nonces WHERE waarde = ?", (waarde,))
-            except BaseException:
-                db.execute("ROLLBACK")
-                raise
+            rij = db.execute("SELECT verloopt FROM nonces WHERE waarde = ?", (waarde,)).fetchone()
+            db.execute("DELETE FROM nonces WHERE waarde = ?", (waarde,))
             db.execute("COMMIT")
         return rij is not None and rij[0] >= nu

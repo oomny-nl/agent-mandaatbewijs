@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
+from pathlib import Path
+from typing import Any
+
 import pytest
+from langchain_core.messages import ToolMessage
 from rich.table import Table
 
 from mandaatbewijs import demo
+from mandaatbewijs.audit import Auditlog
 
 
 def test_verwacht_in_volgorde() -> None:
@@ -111,3 +118,95 @@ def test_waarnemer_registreert(capsys: pytest.CaptureFixture[str]) -> None:
     assert "dossier gelezen (J)" in uit
     assert len(demo.GEBEURTENISSEN) == 5
     demo.GEBEURTENISSEN.clear()
+
+
+def test_waarnemer_toont_protocolfout_met_eigen_tekst(capsys: pytest.CaptureFixture[str]) -> None:
+    demo.GEBEURTENISSEN.clear()
+    demo.waarnemer(
+        {
+            "soort": "register_fout",
+            "tool": "inkomen_opvragen",
+            "tekst": "protocolfout (MCP -32602): Unknown tool: x",
+        }
+    )
+    uit = capsys.readouterr().out
+    assert "FOUT: protocolfout (MCP -32602): Unknown tool: x" in uit
+    assert "WEIGERT" not in uit
+    demo.GEBEURTENISSEN.clear()
+
+
+def _log(pad: Path, *records: dict[str, Any]) -> Path:
+    log = Auditlog(pad, "lir")
+    for velden in records:
+        log.schrijf(**velden)
+    return pad
+
+
+def test_controleer_log_eist_bestaand_gevuld_en_volledig_log(tmp_path: Path) -> None:
+    """Een ontbrekend of leeg log is geen bewijs, ook al is een lege keten technisch intact."""
+    verwacht = [
+        {"gebeurtenis": "toegestaan", "jti": "m-1"},
+        {"gebeurtenis": "geweigerd", "reden": "mandaat_ingetrokken", "jti": "m-1"},
+    ]
+    with pytest.raises(demo.DemoAfwijking, match="ontbreekt"):
+        demo.controleer_log("register", tmp_path / "weg.jsonl", verwacht)
+    (tmp_path / "leeg.jsonl").touch()
+    with pytest.raises(demo.DemoAfwijking, match="leeg"):
+        demo.controleer_log("register", tmp_path / "leeg.jsonl", verwacht)
+    deels = _log(tmp_path / "deels.jsonl", {"gebeurtenis": "toegestaan", "jti": "m-1"})
+    with pytest.raises(demo.DemoAfwijking, match="mandaat_ingetrokken"):
+        demo.controleer_log("register", deels, verwacht)
+    omgekeerd = _log(
+        tmp_path / "omgekeerd.jsonl",
+        {"gebeurtenis": "geweigerd", "reden": "mandaat_ingetrokken", "jti": "m-1"},
+        {"gebeurtenis": "toegestaan", "jti": "m-1"},
+    )
+    with pytest.raises(demo.DemoAfwijking, match="niet op zijn plaats"):
+        demo.controleer_log("register", omgekeerd, verwacht)
+    ander_mandaat = _log(
+        tmp_path / "ander.jsonl",
+        {"gebeurtenis": "toegestaan", "jti": "m-1"},
+        {"gebeurtenis": "geweigerd", "reden": "mandaat_ingetrokken", "jti": "m-2"},
+    )
+    with pytest.raises(demo.DemoAfwijking, match="ontbreekt of staat niet"):
+        demo.controleer_log("register", ander_mandaat, verwacht)
+    goed = _log(
+        tmp_path / "goed.jsonl",
+        {"gebeurtenis": "toegestaan", "jti": "m-1"},
+        {"gebeurtenis": "toegestaan", "jti": "m-1"},  # binnen het cache-interval: mag ertussen
+        {"gebeurtenis": "geweigerd", "reden": "mandaat_ingetrokken", "jti": "m-1", "tool": "t"},
+    )
+    assert len(demo.controleer_log("register", goed, verwacht)) == 3
+    regels = goed.read_text(encoding="utf-8").splitlines()
+    goed.write_text("\n".join([regels[0], regels[2]]) + "\n", encoding="utf-8")
+    with pytest.raises(demo.DemoAfwijking, match="auditketen register"):
+        demo.controleer_log("register", goed, verwacht)
+
+
+class _Gereedschap:
+    def __init__(self, statussen: list[str]) -> None:
+        self.statussen = statussen
+
+    async def voer_uit(self, naam: str, argumenten: dict[str, Any]) -> ToolMessage:
+        return ToolMessage("x", tool_call_id="c", status=self.statussen.pop(0))
+
+
+def test_tot_geweigerd_bewaakt_de_ttl_grens(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Na `ttl` seconden mag geen aanroep meer slagen; daarvoor wel (gecachete statuslijst)."""
+
+    async def geen_pauze(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(demo.asyncio, "sleep", geen_pauze)
+    monkeypatch.setattr(demo, "STATUS_TTL_S", 5)
+    nu = time.time()
+    gereedschap: Any = _Gereedschap(["success", "success", "error"])
+    geweigerd_op, laatste = asyncio.run(demo._tot_geweigerd(gereedschap, "2026-0142", nu))
+    assert laatste is not None
+    assert nu <= laatste <= geweigerd_op
+    te_laat: Any = _Gereedschap(["success"])
+    with pytest.raises(demo.DemoAfwijking, match="later dan de ttl van 5 s"):
+        asyncio.run(demo._tot_geweigerd(te_laat, "2026-0142", nu - 5))
+    meteen: Any = _Gereedschap(["error"])
+    _, geen = asyncio.run(demo._tot_geweigerd(meteen, "2026-0142", nu))
+    assert geen is None

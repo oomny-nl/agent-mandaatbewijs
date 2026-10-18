@@ -3,7 +3,8 @@
 De toolknoop leest het dossier lokaal (eigen organisatie) en roept het inkomensregister aan via MCP.
 Voor elke registeraanroep haalt hij een nonce bij de verifier, kiest hij uit het mandaat alleen de
 claims die de tool nodig heeft (actie, dossier en, als de tool dat vraagt, doel) en tekent hij de
-key-binding-JWT. Weigert het register, dan komt de reden terug als toolfout.
+key-binding-JWT. Weigert het register, dan komt de reden terug in het toolbericht; een protocol- of
+toolfout blijft als zodanig herkenbaar.
 """
 
 from __future__ import annotations
@@ -104,21 +105,31 @@ class Gereedschap:
             self.waarnemer({"soort": "geen_presentatie", "tool": naam, "fout": str(fout)})
             return self._bericht(f"GEEN PRESENTATIE: {fout}", naam, oproep_id, dossier, True)
         self.waarnemer({"soort": "presentatie", "tool": naam, "bekendgemaakt": _labels(gekozen)})
+        soort, tekst = await self._registeraanroep(naam, argumenten)
+        self.waarnemer({"soort": soort, "tool": naam, "tekst": tekst})
+        return self._bericht(tekst, naam, oproep_id, dossier, soort != "resultaat")
+
+    async def _registeraanroep(self, naam: str, argumenten: dict[str, Any]) -> tuple[str, str]:
+        """Roep de registertool aan en geef (soort, tekst).
+
+        Drie uitkomsten naast een resultaat: `register_weigert` als de poort precies deze
+        aanroep met 401 of 403 weigerde (mandaatcontrole), `register_fout` met "protocolfout"
+        voor elke andere MCP-fout en met "toolfout" als de tool zelf een fout teruggaf.
+        """
+        self.auth.laatste_weigering = None
         try:
             resultaat = await self.client.call_tool(naam, argumenten)
-        except MCPError:
-            # De poort van het register weigerde het verzoek op HTTP-niveau (401 of 403).
-            tekst, fout_ = (
-                f"GEWEIGERD door het register: {reden(self.auth.laatste_weigering)}",
-                True,
-            )
-        else:
-            tekst = "\n".join(getattr(d, "text", "") for d in resultaat.content)
-            fout_ = bool(resultaat.is_error)
-        self.waarnemer(
-            {"soort": "register_weigert" if fout_ else "resultaat", "tool": naam, "tekst": tekst}
-        )
-        return self._bericht(tekst, naam, oproep_id, dossier, fout_)
+        except MCPError as fout:
+            if self.auth.laatste_weigering is not None:
+                return (
+                    "register_weigert",
+                    f"GEWEIGERD door het register: {reden(self.auth.laatste_weigering)}",
+                )
+            return "register_fout", f"protocolfout (MCP {fout.code}): {fout.error.message}"
+        tekst = "\n".join(getattr(d, "text", "") for d in resultaat.content)
+        if resultaat.is_error:
+            return "register_fout", f"toolfout: {tekst}"
+        return "resultaat", tekst
 
 
 def _labels(gekozen: list[Disclosure]) -> list[str]:
