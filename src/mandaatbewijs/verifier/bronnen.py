@@ -18,7 +18,8 @@ wordt bewaard maar telt als netwerkfout, nooit als vers; zo ook een verlopen ant
 cache met grace levert. Bij een netwerkfout overbrugging tot `exp`; een ontvangen maar ongeldig
 token, of elke onverwachte fout bij het verwerken ervan, maakt de cache onbruikbaar tot een
 geldige verversing. Gelijktijdige verversingen van dezelfde lijst worden geserialiseerd en delen
-de uitkomst, geslaagd of mislukt.
+de uitkomst, geslaagd of mislukt; alleen een te oud antwoord geldt niet voor wie pas na het begin
+van die download aanvroeg: die haalt zelf op.
 Het token met de hoogste `iat` blijft bewaard, ook als de cache onbruikbaar is: een ouder token
 vervangt het nooit en bevestigt het ook niet (het telt als mislukte verversing), en een ander
 token met dezelfde `iat` maar een andere lijst maakt de cache onbruikbaar. Een achtergrondtaak
@@ -50,6 +51,8 @@ MAX_ANTWOORD = 64 * 1024
 TIMEOUT_S = 5.0
 JWKS_CACHE_S = 300
 JWKS_HERHAAL_S = 10
+# Een antwoord kwam aan maar was te oud; dat bewijst niets over een later begonnen download.
+TE_OUD = frozenset({"statusantwoord_verouderd", "statustoken_verouderd"})
 # Deze headers beschrijven de ontvangen bytes, niet de gedecodeerde inhoud uit `_download`.
 TRANSPORTHEADERS = frozenset({"content-encoding", "content-length", "transfer-encoding"})
 
@@ -332,7 +335,7 @@ class Statuscache:
 
     `afgerond` telt de afgeronde ophaalpogingen en `laatste_fout` bewaart de uitkomst van de
     laatste, zodat wie op een lopende poging wachtte die uitkomst deelt in plaats van zelf opnieuw
-    te downloaden.
+    te downloaden. `poging_begin` is het begin van de laatste poging.
     """
 
     uitgever: Uitgever
@@ -341,6 +344,7 @@ class Statuscache:
     onbruikbaar: bool = False
     afgerond: int = 0
     laatste_fout: BronFout | None = None
+    poging_begin: float = 0.0
     slot: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -376,18 +380,26 @@ class Statusbron:
         Gelijktijdige verversingen van dezelfde lijst wachten op elkaar. Wie wachtte terwijl een
         andere aanvraag ophaalde, krijgt die uitkomst: dezelfde fout, of bij een geslaagde poging
         de bruikbare cache. Zo leidt een storing niet tot een rij downloads achter elkaar.
+
+        Uitzondering: een antwoord dat aankwam maar te oud was (`TE_OUD`), geldt alleen voor wie
+        vóór het begin van die download aanvroeg. Wie later aanvroeg, haalt zelf op: een cache
+        zonder grace levert hem dan mogelijk al een verser antwoord, en anders overbrugt hij op
+        grond van zijn eigen poging. Zonder die uitzondering kreeg een aanroep op T + `ttl` die op
+        een vóór T + `ttl` begonnen download wachtte, nog de oude lijst.
         """
         cache = self._cache(uri, uitgever)
         self.ophaler.controleer_url(uri, uitgever.iss)
-        gezien = cache.afgerond
+        gezien, aangevraagd = cache.afgerond, time.time()
         async with cache.slot:
             if cache.afgerond != gezien:
                 fout = cache.laatste_fout
-                if fout is not None:
+                if fout is None:
+                    if self._bruikbaar(cache, time.time()):
+                        return
+                elif fout.reden not in TE_OUD or cache.poging_begin >= aangevraagd:
                     raise BronFout(fout.reden, fout.klasse, fout.detail)
-                if self._bruikbaar(cache, time.time()):
-                    return
             cache.laatste_fout = None  # een afgebroken poging laat geen oude fout achter
+            cache.poging_begin = time.time()
             try:
                 await self._haal_en_lees(cache, uri, uitgever)
             except BronFout as fout:

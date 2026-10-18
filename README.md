@@ -195,7 +195,7 @@ Elke bewering hierboven heeft een test die faalt als de maatregel wegvalt. Een s
 | Extra of weggelaten disclosure na het tekenen | geweigerd | `sd_hash` klopt niet | `test_disclosure_toegevoegd_na_tekenen_breekt_sd_hash` (u) |
 | Disclosure die `cnf` of `status` selectief maakt | geweigerd | beschermde claim | `test_selectieve_subclaim_in_beschermde_claim_wordt_geweigerd` (u) |
 | Mandaat ingetrokken | geweigerd voor elke aanroep vanaf `ttl` na de intrekking | statuslijst | `test_ingetrokken_geen_toegang_meer_na_ttl` (i) |
-| Mandaat ingetrokken, HTTP-cache tussen register en gemeente | geweigerd vanaf `ttl` na de intrekking | de `Age` van het antwoord telt mee, plus één seconde afronding; een cache die verlopen antwoorden levert (grace), geeft overbrugging tot `exp` | `test_tussenliggende_http_cache_verlengt_het_intrekkingsvenster_niet` (u) |
+| Mandaat ingetrokken, HTTP-cache tussen register en gemeente | geweigerd vanaf `ttl` na de intrekking | de `Age` van het antwoord telt mee, plus één seconde afronding; een cache die verlopen antwoorden levert (grace), geeft overbrugging tot `exp` | `test_tussenliggende_http_cache_verlengt_het_intrekkingsvenster_niet` (u), `test_wie_op_een_te_oude_download_wacht_maar_later_aanvroeg_haalt_zelf_op` (u) |
 | Gemeente onbereikbaar, cache geldig | toegestaan uit cache tot `exp` | overbrugging | `test_statuscache_overbrugt_netwerkfout_maar_niet_ongeldig_token` (u) |
 | Gemeente onbereikbaar, geen cache | geweigerd | status onbekend | `test_geen_cache_en_onbereikbaar_is_status_onbekend` (u) |
 | Mandaat van gemeente Elsweerd | geweigerd zonder netwerkverkeer | uitgever niet vertrouwd | `test_uitgever_niet_vertrouwd_zonder_netwerk` (u) |
@@ -260,7 +260,7 @@ de EUDI-wallet en de NL GOV-profielen in [docs/ONTWERP.md](docs/ONTWERP.md).
 | `src/mandaatbewijs/houder/` | De agent: sleutelpaar, credential, presentatie per aanroep, MCP-verbinding, planner, LangGraph |
 | `src/mandaatbewijs/verifier/` | Inkomensregister: MCP-tools achter een poort, vertrouwenslijst, JWKS- en statuscache, nonces, audit |
 | `src/mandaatbewijs/demo.py` | Regie van de zes scenario's en de bewijstabel |
-| `tests/` | 300 unittests, 14 integratietests tegen de echte keten |
+| `tests/` | 302 unittests, 14 integratietests tegen de echte keten |
 | `docs/` | Ontwerp en dreigingsmodel |
 
 Kwaliteit: `ruff`, `ty`, `pytest`, de compose-keten en gitleaks in CI. Versies zijn exact gepind:

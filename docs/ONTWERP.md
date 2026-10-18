@@ -439,7 +439,9 @@ demo `ttl` op 5 seconden en `exp` op `iat + 60`; de instellingen `STATUSLIJST_TT
   bewuste, door de uitgever met `exp` begrensde afwijking daarop, ten gunste van beschikbaarheid;
 - verlengt bij geen enkele mislukte verversing het ophaaltijdstip of de `exp` van de cache;
 - serialiseert gelijktijdige verversingen van dezelfde lijst: één download, de rest wacht en
-  deelt de uitkomst, ook een mislukte;
+  deelt de uitkomst, ook een mislukte. Een antwoord dat aankwam maar te oud was
+  (`statusantwoord_verouderd`, `statustoken_verouderd`), geldt alleen voor wie vóór het begin van
+  die download aanvroeg; wie later aanvroeg, haalt zelf op (zie het gevolg voor intrekking);
 - bewaart het token met de hoogste `iat`, ook wanneer de cache onbruikbaar is. Een binnengekomen
   token met een oudere `iat` vervangt het niet en bevestigt het ook niet: het telt als mislukte
   verversing (netwerkfout, dus hoogstens overbrugging tot `exp` van het gecachete token), zodat een
@@ -464,11 +466,16 @@ nooit voorbij `exp`; dat valt buiten deze garantie. Een cache die een verlopen a
 aankomst al ouder is dan `ttl`. De verifier behandelt dat als een mislukte verversing: voor die
 aanroep schuift de grens, net als bij een onbereikbare uitgever, op tot `exp`. Wie de grens van
 T + `ttl` wil houden, zet grace voor de statuslijst op nul (de demo slaagt achter Varnish 7.7 met
-`default_grace=0` en faalt met de standaard van 10 seconden). Door de afrondingsseconde telt bij
-`max-age` gelijk aan `ttl` ook een niet-verlopen antwoord met `Age: ttl - 1` als te oud. Dat
-token is nog jonger dan `ttl` en wordt gebruikt, dus de grens blijft T + `ttl`; alleen meldt het
-auditrecord dan `cache-verouderd`. Een aanroep die eerder begint, kan nog worden toegelaten; de achtergrondverversing maakt dat venster in de praktijk korter, maar de grens volgt
-uit de cacheregel en niet uit die klok. Antwoordt de uitgever niet of met een fout, dan schuift de
+`default_grace=0` en faalt met de standaard van 10 seconden). Door de afrondingsseconde en de
+transporttijd kan bij `max-age` gelijk aan `ttl` ook een niet-verlopen antwoord (tot
+`Age: ttl - 1`) bij aankomst als te oud tellen; het auditrecord meldt dan `cache-verouderd`. Dat
+raakt alleen een download die vóór T + `ttl` begon: een cache zonder grace die de `max-age` van
+de uitgever volgt, levert vanaf T + `ttl` alleen antwoorden die na T zijn opgeslagen. Wie op zo'n
+download wachtte maar pas na het begin ervan aanvroeg, deelt die uitkomst niet en haalt zelf op.
+Zo ziet ook een aanroep die precies op T + `ttl` begint terwijl een eerdere download nog loopt,
+de intrekking. Een aanroep die eerder begint, kan nog worden toegelaten; de achtergrondverversing
+maakt dat venster in de praktijk korter, maar de grens volgt uit de cacheregel en niet uit die
+klok. Antwoordt de uitgever niet of met een fout, dan schuift de
 grens op tot de `exp` van het gecachete token (in de demo `iat` + 60). Een aanroep die al is
 toegelaten, loopt door. De demo roept na de intrekking elke seconde aan, de integratietest elke
 kwart seconde; beide falen als een aanroep die om T + `ttl` of later begon, nog is toegelaten. De

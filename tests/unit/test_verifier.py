@@ -1000,6 +1000,99 @@ def test_mislukte_verversing_wordt_gedeeld_door_wie_wachtte(
     assert uitkomsten == [bronnen.Statusuitkomst(0, "cache-verouderd")] * 8
 
 
+def _vertraagde_statusbron(
+    sleutel: Sleutelpaar, klok: _Klok, lever: Any
+) -> tuple[Statusbron, dict[str, Any]]:
+    """Statusbron achter `lever(teller)` → (token, Age); de eerste statusdownload wacht.
+
+    Die eerste download meldt zich via `stand["onderweg"]` en levert pas na `stand["door"]`,
+    waarna de klok op `stand["aankomst"]` staat. Latere downloads zijn direct.
+    """
+    stand: dict[str, Any] = {"n": 0, "onderweg": asyncio.Event(), "door": asyncio.Event()}
+
+    async def antwoord(request: httpx2.Request) -> httpx2.Response:
+        if request.url.path.endswith("jwt-vc-issuer"):
+            return httpx2.Response(
+                200,
+                json={"issuer": ISS, "jwks": {"keys": [sleutel.jwks_lid]}},
+                headers={"cache-control": "max-age=100000"},
+            )
+        stand["n"] += 1
+        token, age = lever(stand["n"])
+        if stand["n"] == 1:
+            stand["onderweg"].set()
+            await stand["door"].wait()
+            klok.nu = stand["aankomst"]
+        kop = {**STATUS_KOP, "cache-control": "max-age=5", "age": age}
+        return httpx2.Response(200, text=token, headers=kop)
+
+    ophaler = Ophaler(
+        True, frozenset({"localhost"}), httpx2.AsyncClient(transport=httpx2.MockTransport(antwoord))
+    )  # type: ignore[arg-type]
+    return Statusbron(ophaler, Sleutelbron(ophaler)), stand
+
+
+async def _tijdens_download(
+    bron: Statusbron, stand: dict[str, Any], klok: _Klok, later: float, aantal: int
+) -> list[bronnen.Statusuitkomst]:
+    """Eén aanroep start de download; `aantal` aanroepen beginnen op `later` en wachten erop."""
+    eerste = asyncio.create_task(bron.status(STATUS_URI, 3, LINDEVOORT))
+    await stand["onderweg"].wait()
+    klok.nu = later
+    wachtend = [asyncio.create_task(bron.status(STATUS_URI, 3, LINDEVOORT)) for _ in range(aantal)]
+    for _ in range(5):
+        await asyncio.sleep(0)  # elke wachtende staat nu bij het slot, met zijn aanvraagtijd
+    stand["door"].set()
+    return list(await asyncio.gather(eerste, *wachtend))
+
+
+def test_wie_op_een_te_oude_download_wacht_maar_later_aanvroeg_haalt_zelf_op(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Een cache zonder grace sloeg de oude lijst op om 999,9; de intrekking volgt op T = 1000.
+
+    Aanroep A begint om 1004,8 en krijgt het nog verse antwoord met `Age: 4`, dat om 1005,2
+    aankomt en dan te oud is. Aanroep B begint precies op T + ttl = 1005,0 en wacht op die
+    download. A begon vóór T + ttl en mag overbruggen; B moet de intrekking zien. Voorheen deelde
+    B de uitkomst van A en werd hij toegelaten.
+    """
+    sleutel = Sleutelpaar.nieuw("u1")
+    klok = _Klok(monkeypatch, 1004.8)
+    oud = _statustoken(sleutel, 0, iat=999, exp=1059)
+    nieuw = _statustoken(sleutel, 1, iat=1000, exp=1060)
+    cache: dict[str, Any] = {"tijd": 999.9, "token": oud}
+
+    def lever(_: int) -> tuple[str, str]:
+        if klok.nu - cache["tijd"] >= 5:  # niet meer vers voor de cache: naar de uitgever
+            cache.update(tijd=klok.nu, token=nieuw)
+        return cache["token"], str(math.floor(klok.nu - cache["tijd"]))
+
+    bron, stand = _vertraagde_statusbron(sleutel, klok, lever)
+    stand["aankomst"] = 1005.2
+    a, b = _loop(_tijdens_download(bron, stand, klok, 1005.0, 1))
+    assert a == bronnen.Statusuitkomst(0, "cache-verouderd")
+    assert b == bronnen.Statusuitkomst(1, "vers")
+    assert stand["n"] == 2
+
+
+def test_te_oud_antwoord_kost_per_groep_wachtenden_hoogstens_een_extra_download(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Een cache die steeds te oud levert (grace): wie later aanvroeg, haalt één keer zelf op.
+
+    De eerste wachtende haalt opnieuw op; de anderen vroegen vóór het begin van die tweede
+    download aan en delen de uitkomst. Zo blijven het twee downloads, niet één per aanroep.
+    """
+    sleutel = Sleutelpaar.nieuw("u1")
+    klok = _Klok(monkeypatch, 1000)
+    token = _statustoken(sleutel, 0, iat=990, exp=2000)
+    bron, stand = _vertraagde_statusbron(sleutel, klok, lambda _: (token, "9"))
+    stand["aankomst"] = 1000.2
+    uitkomsten = _loop(_tijdens_download(bron, stand, klok, 1000.1, 7))
+    assert uitkomsten == [bronnen.Statusuitkomst(0, "cache-verouderd")] * 8
+    assert stand["n"] == 2
+
+
 def test_opgehaald_is_het_begin_van_de_download(monkeypatch: pytest.MonkeyPatch) -> None:
     """De cacheduur telt vanaf het begin van de download: een trage download verlengt niets."""
     sleutel = Sleutelpaar.nieuw("u1")

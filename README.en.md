@@ -193,7 +193,7 @@ Every claim above has a test that fails when the measure is removed. A selection
 | Disclosure added or removed after signing | refused | `sd_hash` mismatch | `test_disclosure_toegevoegd_na_tekenen_breekt_sd_hash` (u) |
 | Disclosure that makes `cnf` or `status` selective | refused | protected claim | `test_selectieve_subclaim_in_beschermde_claim_wordt_geweigerd` (u) |
 | Mandate revoked | refused for every call from `ttl` after the revocation | status list | `test_ingetrokken_geen_toegang_meer_na_ttl` (i) |
-| Mandate revoked, HTTP cache between register and municipality | refused from `ttl` after the revocation | the response's `Age` counts, plus one second for rounding; a cache that serves expired responses (grace) gives bridging until `exp` | `test_tussenliggende_http_cache_verlengt_het_intrekkingsvenster_niet` (u) |
+| Mandate revoked, HTTP cache between register and municipality | refused from `ttl` after the revocation | the response's `Age` counts, plus one second for rounding; a cache that serves expired responses (grace) gives bridging until `exp` | `test_tussenliggende_http_cache_verlengt_het_intrekkingsvenster_niet` (u), `test_wie_op_een_te_oude_download_wacht_maar_later_aanvroeg_haalt_zelf_op` (u) |
 | Municipality unreachable, cache valid | allowed from cache until `exp` | bridging | `test_statuscache_overbrugt_netwerkfout_maar_niet_ongeldig_token` (u) |
 | Municipality unreachable, no cache | refused | status unknown | `test_geen_cache_en_onbereikbaar_is_status_onbekend` (u) |
 | Mandate from the municipality of Elsweerd | refused without network traffic | issuer not trusted | `test_uitgever_niet_vertrouwd_zonder_netwerk` (u) |
@@ -258,7 +258,7 @@ relation to the EUDI wallet and the Dutch NL GOV profiles are in [docs/ONTWERP.m
 | `src/mandaatbewijs/houder/` | The agent: key pair, credential, presentation per call, MCP connection, planner, LangGraph |
 | `src/mandaatbewijs/verifier/` | Income register: MCP tools behind a gateway, trust list, JWKS and status cache, nonces, audit |
 | `src/mandaatbewijs/demo.py` | Orchestration of the six scenarios and the evidence table |
-| `tests/` | 300 unit tests, 14 integration tests against the real chain |
+| `tests/` | 302 unit tests, 14 integration tests against the real chain |
 | `docs/` | Design and threat model (Dutch) |
 
 Quality: `ruff`, `ty`, `pytest`, the Compose chain and gitleaks in CI. Versions are pinned
