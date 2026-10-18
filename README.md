@@ -255,7 +255,7 @@ de EUDI-wallet en de NL GOV-profielen in [docs/ONTWERP.md](docs/ONTWERP.md).
 | `src/mandaatbewijs/houder/` | De agent: sleutelpaar, credential, presentatie per aanroep, MCP-verbinding, planner, LangGraph |
 | `src/mandaatbewijs/verifier/` | Inkomensregister: MCP-tools achter een poort, vertrouwenslijst, JWKS- en statuscache, nonces, audit |
 | `src/mandaatbewijs/demo.py` | Regie van de zes scenario's en de bewijstabel |
-| `tests/` | 261 unittests, 14 integratietests tegen de echte keten |
+| `tests/` | 263 unittests, 14 integratietests tegen de echte keten |
 | `docs/` | Ontwerp en dreigingsmodel |
 
 Kwaliteit: `ruff`, `ty`, `pytest`, de compose-keten en gitleaks in CI. Versies zijn exact gepind:

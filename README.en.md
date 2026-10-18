@@ -254,7 +254,7 @@ relation to the EUDI wallet and the Dutch NL GOV profiles are in [docs/ONTWERP.m
 | `src/mandaatbewijs/houder/` | The agent: key pair, credential, presentation per call, MCP connection, planner, LangGraph |
 | `src/mandaatbewijs/verifier/` | Income register: MCP tools behind a gateway, trust list, JWKS and status cache, nonces, audit |
 | `src/mandaatbewijs/demo.py` | Orchestration of the six scenarios and the evidence table |
-| `tests/` | 261 unit tests, 14 integration tests against the real chain |
+| `tests/` | 263 unit tests, 14 integration tests against the real chain |
 | `docs/` | Design and threat model (Dutch) |
 
 Quality: `ruff`, `ty`, `pytest`, the Compose chain and gitleaks in CI. Versions are pinned

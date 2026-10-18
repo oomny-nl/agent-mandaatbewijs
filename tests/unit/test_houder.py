@@ -15,7 +15,7 @@ from mcp_types import INTERNAL_ERROR, INVALID_PARAMS
 from starlette.testclient import TestClient
 
 from mandaatbewijs.houder.graaf import Gereedschap, Toolbeleid
-from mandaatbewijs.houder.planner import deterministische_planner
+from mandaatbewijs.houder.planner import LLM_OMGEVING, deterministische_planner, llm_model
 from mandaatbewijs.houder.portemonnee import Portemonnee, PortemonneeFout
 from mandaatbewijs.houder.verbinding import MandaatAuth, reden
 from mandaatbewijs.sdjwt import Disclosure, b64url, ontleed, serialiseer
@@ -120,6 +120,36 @@ def test_planner_wordt_gekaapt_en_meldt_weigeringen() -> None:
 def test_planner_zonder_dossiernummer() -> None:
     antwoord = deterministische_planner([HumanMessage("doe iets")])
     assert not antwoord.tool_calls
+
+
+def test_llm_model_behandelt_lege_omgevingsvariabelen_als_niet_gezet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Compose geeft niet-ingevulde variabelen leeg door; dan gelden de standaardwaarden."""
+    pytest.importorskip("langchain_openai")
+    for naam in LLM_OMGEVING:
+        monkeypatch.setenv(naam, "")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    model = llm_model()
+    assert type(model).__name__ == "ChatOpenAI"
+    assert model.model_name == "gpt-4.1-mini"
+    assert str(model.root_client.base_url) == "https://api.openai.com/v1/"
+
+
+def test_llm_model_kiest_azure_met_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("langchain_openai")
+    for naam in LLM_OMGEVING:
+        monkeypatch.setenv(naam, "")
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://voorbeeld.openai.azure.com")
+    monkeypatch.setenv("AZURE_OPENAI_DEPLOYMENT", "assistent")
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "test")
+    monkeypatch.setenv("OPENAI_API_VERSION", "2024-10-21")
+    model = llm_model()
+    assert type(model).__name__ == "AzureChatOpenAI"
+    assert model.deployment_name == "assistent"
+    assert str(model.root_client.base_url).startswith(
+        "https://voorbeeld.openai.azure.com/openai/deployments/assistent"
+    )
 
 
 def test_uitgever_app_is_herbruikbaar(uitgever: Dienst) -> None:
