@@ -16,3 +16,7 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # Het image volgt requires-python (3.13); een Python-minorupgrade is een bewuste keuze.
+    ignore:
+      - dependency-name: python
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
