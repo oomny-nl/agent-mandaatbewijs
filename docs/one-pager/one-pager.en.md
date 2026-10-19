@@ -33,10 +33,10 @@ The municipality issues the mandate as a verifiable credential. The agent carrie
 - **Verification without an account.** The register verifies with its own trust list and the
   municipality's public signing keys and status list. It has no account at the municipality and does
   not call back on every request.
-- **Revocable.** The municipality revokes the mandate through a Token Status List. The register
-  refuses the agent as soon as its copy of the status list expires, in the demo within five seconds;
-  if the municipality is unreachable, that copy holds until its expiry time at most. A kill switch
-  blocks the agent's key.
+- **Revocable.** The municipality revokes the mandate through a Token Status List. If the
+  municipality is reachable, the register refuses the agent within five seconds of revocation in the
+  demo; during an outage it uses its cached status list at most until the status token expires. A
+  kill switch blocks the agent's key.
 - **Audit trail on both sides.** Municipality and register each keep a hash chain: issuance,
   revocation, kill switch, every admission and every refusal.
 

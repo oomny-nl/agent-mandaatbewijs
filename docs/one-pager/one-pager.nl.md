@@ -33,10 +33,10 @@ De gemeente geeft het mandaat uit als verifieerbare credential. De agent draagt 
 - **Controle zonder account.** Het register controleert met zijn eigen vertrouwenslijst en de
   publieke sleutels en statuslijst van de gemeente. Het heeft geen account bij de gemeente en vraagt
   niet per aanroep na.
-- **Intrekbaar.** De gemeente trekt het mandaat in via een Token Status List. Het register weigert
-  de agent zodra zijn kopie van de statuslijst verloopt, in de demo uiterlijk vijf seconden later;
-  is de gemeente onbereikbaar, dan geldt die kopie hoogstens tot haar vervaltijd. Een noodstop
-  blokkeert de sleutel van de agent.
+- **Intrekbaar.** De gemeente trekt het mandaat in via een Token Status List. Is de gemeente
+  bereikbaar, dan weigert het register de agent in de demo uiterlijk vijf seconden na de intrekking;
+  bij een storing gebruikt het zijn gecachete statuslijst hoogstens tot het statustoken verloopt.
+  Een noodstop blokkeert de sleutel van de agent.
 - **Auditspoor aan beide kanten.** Gemeente en register houden elk een hashketen bij: uitgifte,
   intrekking, noodstop, elke toelating en elke weigering.
 
