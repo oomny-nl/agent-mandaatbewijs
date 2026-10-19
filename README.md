@@ -38,8 +38,8 @@ Deze repo laat zien hoe dat kan met de bouwstenen van verifieerbare credentials:
 het mandaat uit als [SD-JWT VC](https://datatracker.ietf.org/doc/draft-ietf-oauth-sd-jwt-vc/)
 (selective disclosure, [RFC 9901](https://www.rfc-editor.org/rfc/rfc9901)), gebonden aan de sleutel
 van de agent; de agent toont per toolaanroep alleen de claims die het register nodig heeft, met een
-key-binding JWT op de nonce van het register; het register controleert alles met publieke
-informatie van de gemeente (vertrouwenslijst, JWKS, [Token Status List](https://datatracker.ietf.org/doc/draft-ietf-oauth-status-list/))
+key-binding JWT op de nonce van het register; het register controleert alles met zijn eigen
+vertrouwenslijst en publieke informatie van de gemeente (JWKS, [Token Status List](https://datatracker.ietf.org/doc/draft-ietf-oauth-status-list/))
 en logt elke beslissing. De agent is een LangGraph-agent die zijn tools via MCP aanroept.
 
 Het is het tweede antwoord op dezelfde vraag als [`agent-mandaat`](https://github.com/oomny-nl/agent-mandaat).
@@ -209,7 +209,7 @@ Elke bewering hierboven heeft een test die faalt als de maatregel wegvalt. Een s
 
 | Actie | Uitkomst | Reden | Test |
 |---|---|---|---|
-| Inkomen opvragen voor het mandaatdossier | toegestaan | binnen mandaat; register ziet alleen doel, actie en dossier | `test_toegestaan_binnen_mandaat` (i) |
+| Inkomen opvragen voor het mandaatdossier | toegestaan | binnen mandaat; alleen doel, actie en dossier bekendgemaakt, niet de medewerker | `test_toegestaan_binnen_mandaat` (i) |
 | Ander dossier uit Sannes caseload | geweigerd | dossier buiten mandaat | `test_ander_dossier_uit_de_caseload_blijft_buiten_het_mandaat` (i) |
 | Correctie indienen | geweigerd | actie buiten mandaat; geen doel geaccepteerd | `test_bereik_en_doel` (u) |
 | Zelfde presentatie acht keer tegelijk | één keer toegestaan | nonce al gebruikt | `test_gelijktijdige_replay_slaagt_precies_een_keer` (i) |
@@ -291,7 +291,7 @@ Kwaliteit: `ruff`, `ty`, `pytest`, de compose-keten en gitleaks in CI. Versies z
 
 ## Over
 
-Gebouwd door Michael Owen Meijer ([Oomny B.V.](https://www.oomny.nl)), identity-architect en
+Gebouwd door Michael Owen Meijer ([Oomny B.V.](https://www.oomny.nl)), senior identity-architect en
 AI-engineer voor overheid en cloud. Alle namen, dossiers en bedragen in deze repo zijn verzonnen.
 "Mandaat" is hier een technische werkterm, geen bestuursrechtelijk mandaat in de zin van de Awb.
 

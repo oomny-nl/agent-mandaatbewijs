@@ -38,8 +38,8 @@ This repository shows how to do that with the building blocks of verifiable cred
 municipality issues the mandate as an [SD-JWT VC](https://datatracker.ietf.org/doc/draft-ietf-oauth-sd-jwt-vc/)
 (selective disclosure, [RFC 9901](https://www.rfc-editor.org/rfc/rfc9901)) bound to the agent's
 key. Per tool call the agent discloses only the claims the register needs, with a key-binding JWT
-over the register's nonce. The register verifies everything with public information from the
-municipality (a trust list, a JWKS and a [Token Status List](https://datatracker.ietf.org/doc/draft-ietf-oauth-status-list/))
+over the register's nonce. The register verifies everything with its own trust list and public
+information from the municipality (a JWKS and a [Token Status List](https://datatracker.ietf.org/doc/draft-ietf-oauth-status-list/))
 and logs every decision. The agent is a LangGraph agent that calls its tools over MCP.
 
 It is the second answer to the same question as [`agent-mandaat`](https://github.com/oomny-nl/agent-mandaat).
@@ -207,7 +207,7 @@ Every claim above has a test that fails when the measure is removed. A selection
 
 | Action | Outcome | Reason | Test |
 |---|---|---|---|
-| Request income for the mandated case | allowed | within mandate; register sees only purpose, action and case | `test_toegestaan_binnen_mandaat` (i) |
+| Request income for the mandated case | allowed | within mandate; only purpose, action and case disclosed, not the employee | `test_toegestaan_binnen_mandaat` (i) |
 | Another case from Sanne's caseload | refused | case outside mandate | `test_ander_dossier_uit_de_caseload_blijft_buiten_het_mandaat` (i) |
 | File a correction | refused | action outside mandate; no purpose accepted | `test_bereik_en_doel` (u) |
 | Same presentation eight times concurrently | allowed once | nonce already used | `test_gelijktijdige_replay_slaagt_precies_een_keer` (i) |
@@ -289,7 +289,7 @@ exactly: `uv.lock`, images by digest, GitHub Actions by commit.
 
 ## About
 
-Built by Michael Owen Meijer ([Oomny B.V.](https://www.oomny.nl)), identity architect and AI
+Built by Michael Owen Meijer ([Oomny B.V.](https://www.oomny.nl)), senior identity architect and AI
 engineer for government and cloud. All names, cases and amounts in this repository are fictional.
 "Mandaat" is a technical working term here, not a mandate under Dutch administrative law.
 

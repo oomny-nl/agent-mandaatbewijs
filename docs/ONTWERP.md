@@ -29,9 +29,9 @@ verifieerbare credentials:
 - De **houder** (de agent) draagt dat mandaat zelf mee en toont per toolaanroep alleen de claims die
   de ontvanger nodig heeft, met een bewijs dat hij de gebonden sleutel heeft.
 - De **verifier** (een API van een andere organisatie) controleert handtekening, sleutelbinding,
-  versheid, geldigheid, doel en bereik met alleen publieke informatie van de uitgever: een
-  vertrouwenslijst, een JWKS en een statuslijst. Geen live vraag per aanroep, geen account, geen
-  gedeeld geheim.
+  versheid, geldigheid, doel en bereik met een eigen vertrouwenslijst en verder alleen publieke
+  informatie van de uitgever: een JWKS en een statuslijst. Geen live vraag per aanroep, geen
+  account, geen gedeeld geheim.
 
 Lezers: dezelfde als bij `agent-mandaat`: CISO's en security-architecten bij Rijk,
 uitvoeringsorganisaties en gemeenten; IAM- en platformteams die agents moeten toelaten over
