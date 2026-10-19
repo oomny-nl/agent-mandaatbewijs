@@ -1,0 +1,15 @@
+@page { size: A4; margin: 15mm 17mm 13mm 17mm; }
+html { font-family: "IBM Plex Sans", "Helvetica Neue", Helvetica, Arial, sans-serif; font-size: 9.4pt; line-height: 1.36; color: #14191F; }
+body { margin: 0; }
+h1 { font-family: "IBM Plex Serif", Georgia, serif; font-weight: 500; font-size: 22pt; color: #0F4C5C; margin: 0 0 2mm 0; }
+h1 + p { margin-top: 0; }
+h2 { font-size: 10.5pt; font-weight: 600; color: #0F4C5C; margin: 4.5mm 0 1.2mm 0; padding-top: 2mm; border-top: 0.5pt solid #CDD4DB; }
+p { margin: 0 0 2mm 0; }
+ul { margin: 0 0 2mm 0; padding-left: 4.5mm; }
+li { margin-bottom: 1.2mm; }
+strong { font-weight: 600; }
+code { font-family: Menlo, monospace; font-size: 8.8pt; }
+a { color: #0F4C5C; text-decoration: none; }
+img.kop { width: 100%; height: 30mm; object-fit: cover; margin: 1mm 0 3mm 0; }
+figure { margin: 0; }
+figcaption { display: none; }
