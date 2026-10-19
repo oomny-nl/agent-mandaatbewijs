@@ -291,7 +291,7 @@ Kwaliteit: `ruff`, `ty`, `pytest`, de compose-keten en gitleaks in CI. Versies z
 
 ## Over
 
-Gebouwd door Michael Owen Meijer ([Oomny B.V.](https://www.oomny.nl)), identity-architect en
+Gebouwd door Michael Owen Meijer ([Oomny B.V.](https://www.oomny.nl)), senior identity-architect en
 AI-engineer voor overheid en cloud. Alle namen, dossiers en bedragen in deze repo zijn verzonnen.
 "Mandaat" is hier een technische werkterm, geen bestuursrechtelijk mandaat in de zin van de Awb.
 

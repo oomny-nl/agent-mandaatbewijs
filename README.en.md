@@ -289,7 +289,7 @@ exactly: `uv.lock`, images by digest, GitHub Actions by commit.
 
 ## About
 
-Built by Michael Owen Meijer ([Oomny B.V.](https://www.oomny.nl)), identity architect and AI
+Built by Michael Owen Meijer ([Oomny B.V.](https://www.oomny.nl)), senior identity architect and AI
 engineer for government and cloud. All names, cases and amounts in this repository are fictional.
 "Mandaat" is a technical working term here, not a mandate under Dutch administrative law.
 
