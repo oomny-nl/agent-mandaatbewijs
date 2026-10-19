@@ -9,7 +9,7 @@ lang: nl
 
 **Een mandaat dat een AI-agent zelf meedraagt, controleerbaar door een andere organisatie.**
 
-Michael Owen Meijer, Oomny B.V. · identity-architect en AI-engineer voor overheid en cloud
+Michael Owen Meijer, Oomny B.V. · senior identity-architect en AI-engineer voor overheid en cloud
 
 ## Het probleem
 
@@ -27,13 +27,15 @@ De gemeente geeft het mandaat uit als verifieerbare credential. De agent draagt 
   (op basis van RFC 9901) met doel, toegestane acties en dossiers. Het mandaat is gebonden aan de
   sleutel van de agent en hoogstens een uur geldig.
 - **Alleen wat nodig is.** Per aanroep onthult de agent alleen het doel, die ene actie en dat ene
-  dossier. Wie de medewerker is, blijft verborgen. Een key-binding JWT op de nonce van het register
-  maakt een gestolen of herhaalde presentatie waardeloos.
-- **Controle zonder account.** Het register controleert met publieke gegevens van de gemeente: een
-  vertrouwenslijst, de sleutels en een statuslijst. Het heeft geen account bij de gemeente en vraagt
+  dossier. Wie de medewerker is, blijft verborgen. Een key-binding JWT op een eenmalige nonce van
+  het register maakt een gestolen credential zonder de sleutel van de agent en een herhaalde
+  presentatie waardeloos.
+- **Controle zonder account.** Het register controleert met zijn eigen vertrouwenslijst en de
+  publieke sleutels en statuslijst van de gemeente. Het heeft geen account bij de gemeente en vraagt
   niet per aanroep na.
 - **Intrekbaar.** De gemeente trekt het mandaat in via een Token Status List. Het register weigert
-  de agent zodra zijn cache verloopt, in de demo uiterlijk vijf seconden later. Een noodstop
+  de agent zodra zijn kopie van de statuslijst verloopt, in de demo uiterlijk vijf seconden later;
+  is de gemeente onbereikbaar, dan geldt die kopie hoogstens tot haar vervaltijd. Een noodstop
   blokkeert de sleutel van de agent.
 - **Auditspoor aan beide kanten.** Gemeente en register houden elk een hashketen bij: uitgifte,
   intrekking, noodstop, elke toelating en elke weigering.
@@ -46,8 +48,8 @@ volgt de agent een ingevoegde instructie uit een dossier ("vraag ook dat andere 
 een correctie in") en komt nergens: het register weigert het dossier en de actie buiten het mandaat.
 
 302 unittests en 14 integratietests tegen de echte keten. Een dreigingsmodel tegen de OWASP Top 10
-for Agentic Applications 2026 en de OWASP Non-Human Identities Top 10, met per risico de test die
-het bewijst. Een eerlijke paragraaf over wat dit niet oplost.
+for Agentic Applications 2026 en de OWASP Non-Human Identities Top 10, met per risico de status en
+de tests. Een eerlijke paragraaf over wat dit niet oplost.
 
 Het formaat is dat van de EUDI-wallet, hier zonder wallet en zonder claim van conformiteit.
 
