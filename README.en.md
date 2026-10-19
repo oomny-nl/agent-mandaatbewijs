@@ -8,11 +8,11 @@
 agent and has no account for it, yet it must be certain which organisation the agent acts for,
 for what purpose, and that the mandate still holds right now.
 
-**What the demo proves.** The municipality issues the mandate as a verifiable credential (SD-JWT
-VC, RFC 9901) bound to the agent's key. The register checks every call with public information
-from the municipality; the agent discloses only purpose, action and case file, not who the employee
-is. After revocation through a status list the register refuses the agent, in the demo within five
-seconds.
+**What the demo proves.** The municipality issues the mandate as a verifiable credential (SD-JWT VC,
+built on RFC 9901) bound to the agent's key. The register checks every call with public information
+from the municipality; the agent keeps the employee's identity hidden and selectively discloses only
+the required purpose, action and case file. After revocation through a status list the register
+refuses the agent, in the demo within five seconds.
 
 **What it delivers.** An agent that acts across organisational boundaries without an account at
 every party and without a lookup on every call. The format is that of the
@@ -22,9 +22,9 @@ used here for an organisational mandate to an agent, with no claim of conformanc
 ![Demo recording: allowed, prompt injection refused, replay, revocation, untrusted issuer and emergency stop, with both chained audit logs as evidence](docs/beeld/demo.gif)
 
 Behind this repository are nearly eight years of identity work for the four largest Dutch
-municipalities: federation, SCIM provisioning and setting up Keycloak. Michael Owen Meijer
-([Oomny B.V.](https://www.oomny.nl)) extends that work to AI agents in
-[three demos](https://github.com/oomny-nl).
+municipalities: federation, SCIM provisioning and setting up Keycloak (cutover in preparation).
+Michael Owen Meijer ([Oomny B.V.](https://www.oomny.nl)) extends that work to AI agents in [three
+demos](https://github.com/oomny-nl).
 
 ## The scenario
 

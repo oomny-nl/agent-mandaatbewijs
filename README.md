@@ -8,11 +8,11 @@
 niet en heeft geen account voor hem, maar moet wel zeker weten namens welke organisatie hij
 handelt, waarvoor, en dat het mandaat nu nog geldt.
 
-**Wat de demo bewijst.** De gemeente geeft het mandaat uit als verifieerbare credential (SD-JWT VC,
-RFC 9901), gebonden aan de sleutel van de agent. Het register controleert elke aanroep met publieke
-gegevens van de gemeente; de agent toont alleen doel, actie en dossier, niet wie de medewerker is.
-Na intrekking via een statuslijst weigert het register de agent, in de demo uiterlijk vijf seconden
-later.
+**Wat de demo bewijst.** De gemeente geeft het mandaat uit als verifieerbare credential (SD-JWT VC
+op basis van RFC 9901), gebonden aan de sleutel van de agent. Het register controleert elke aanroep
+met publieke gegevens van de gemeente; de agent houdt verborgen wie de medewerker is en onthult
+alleen het benodigde doel, de actie en het dossier. Na intrekking via een statuslijst weigert het
+register de agent, in de demo uiterlijk vijf seconden later.
 
 **Wat het oplevert.** Een agent die over organisatiegrenzen heen handelt, zonder account bij elke
 partij en zonder navraag per aanroep. Het formaat is dat van de
@@ -22,8 +22,9 @@ hier gebruikt voor een organisatiemandaat aan een agent, zonder claim van confor
 ![Demo-opname: toegestaan, prompt-injectie geweigerd, replay, intrekking, niet-vertrouwde uitgever en noodstop, met beide geketende auditlogs als bewijs](docs/beeld/demo.gif)
 
 Achter deze repo zit bijna acht jaar identitywerk voor de vier grote gemeenten: federatie,
-SCIM-provisioning en de inrichting van Keycloak. Michael Owen Meijer ([Oomny B.V.](https://www.oomny.nl))
-trekt dat werk in [drie demo's](https://github.com/oomny-nl) door naar AI-agents.
+SCIM-provisioning en de inrichting van Keycloak (cutover in voorbereiding). Michael Owen Meijer
+([Oomny B.V.](https://www.oomny.nl)) trekt dat werk in [drie demo's](https://github.com/oomny-nl)
+door naar AI-agents.
 
 ## Het scenario
 
