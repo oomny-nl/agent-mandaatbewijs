@@ -8,11 +8,11 @@ authors = [{ name = "Michael Owen Meijer", email = "michael@oomny.nl" }]
 requires-python = ">=3.13,<3.14"
 dependencies = [
     "mcp==2.3.0",
-    "httpx2==2.13.1",
+    "httpx2==2.16.0",
     "langgraph==1.2.16",
-    "langchain-core==1.6.12",
-    "joserfc==1.7.5",
-    "fastapi==0.143.3",
+    "langchain-core==1.6.13",
+    "joserfc==1.7.7",
+    "fastapi==0.159.1",
     "uvicorn==0.54.0",
     "pydantic==2.14.1",
     "rich==15.0.0",
@@ -30,7 +30,7 @@ mandaatbewijs-demo = "mandaatbewijs.demo:main"
 dev = [
     "pytest==9.1.1",
     "ruff==0.17.1",
-    "ty==0.0.89",
+    "ty==0.0.90",
 ]
 
 [build-system]
