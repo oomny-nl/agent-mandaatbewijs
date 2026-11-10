@@ -56,8 +56,8 @@ The format is that of the EUDI Wallet, here without a wallet and with no claim o
 ## Why me
 
 Identity and security since 2011, nearly eight years for the four largest Dutch municipalities, with
-federation across organisational boundaries at the core: connections between the municipalities and
-a shared service with ADFS and Entra ID, SCIM provisioning, and Keycloak (API access in production
+federation across organisations at the core: connections between the municipalities and a shared
+service with ADFS and Entra ID, SCIM provisioning, and Keycloak (API access in production
 since October 2026). Since 2026 I have been building AI agents with tool calling and MCP. An agent
 that calls on another organisation needs the same trust, but per mandate.
 
