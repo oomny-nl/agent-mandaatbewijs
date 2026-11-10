@@ -22,9 +22,9 @@ hier gebruikt voor een organisatiemandaat aan een agent, zonder claim van confor
 ![Demo-opname: toegestaan, prompt-injectie geweigerd, replay, intrekking, niet-vertrouwde uitgever en noodstop, met beide geketende auditlogs als bewijs](docs/beeld/demo.gif)
 
 Achter deze repo zit bijna acht jaar identitywerk voor de vier grote gemeenten: federatie,
-SCIM-provisioning en de inrichting van Keycloak (cutover in voorbereiding). Michael Owen Meijer
-([Oomny B.V.](https://www.oomny.nl)) trekt dat werk in [drie demo's](https://github.com/oomny-nl)
-door naar AI-agents.
+SCIM-provisioning en Keycloak als opvolger van Azure AD B2C (API-toegang sinds oktober 2026 in
+productie). Michael Owen Meijer ([Oomny B.V.](https://www.oomny.nl)) trekt dat werk in [drie
+demo's](https://github.com/oomny-nl) door naar AI-agents.
 
 ## Het scenario
 

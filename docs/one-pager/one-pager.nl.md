@@ -57,7 +57,7 @@ Het formaat is dat van de EUDI-wallet, hier zonder wallet en zonder claim van co
 
 Identity en security sinds 2011, bijna acht jaar voor de vier grote gemeenten, met federatie over
 organisatiegrenzen als kern: koppelingen tussen de gemeenten en een gedeelde voorziening met ADFS en
-Entra ID, SCIM-provisioning, en de inrichting van Keycloak (cutover in voorbereiding). Sinds 2026
+Entra ID, SCIM-provisioning, en Keycloak (API-toegang sinds oktober 2026 in productie). Sinds 2026
 bouw ik AI-agents met tool calling en MCP. Een agent die bij een andere organisatie aanklopt, vraagt
 hetzelfde vertrouwen, maar dan per mandaat.
 
