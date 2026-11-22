@@ -8,18 +8,18 @@ authors = [{ name = "Michael Owen Meijer", email = "michael@oomny.nl" }]
 requires-python = ">=3.13,<3.14"
 dependencies = [
     "mcp==2.3.0",
-    "httpx2==2.16.0",
-    "langgraph==1.2.20",
-    "langchain-core==1.7.6",
+    "httpx2==2.16.2",
+    "langgraph==1.2.22",
+    "langchain-core==1.8.3",
     "joserfc==1.8.0",
-    "fastapi==0.162.0",
+    "fastapi==0.165.0",
     "uvicorn==0.54.0",
-    "pydantic==2.14.2",
+    "pydantic==2.14.3",
     "rich==15.0.0",
 ]
 
 [project.optional-dependencies]
-llm = ["langchain-openai==1.7.4"]
+llm = ["langchain-openai==1.8.3"]
 
 [project.scripts]
 mandaatbewijs-uitgever = "mandaatbewijs.uitgever.app:main"
@@ -29,8 +29,8 @@ mandaatbewijs-demo = "mandaatbewijs.demo:main"
 [dependency-groups]
 dev = [
     "pytest==9.2.0",
-    "ruff==0.17.3",
-    "ty==0.0.97",
+    "ruff==0.17.5",
+    "ty==0.0.107",
 ]
 
 [build-system]
